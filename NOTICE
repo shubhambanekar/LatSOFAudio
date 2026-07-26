@@ -1,0 +1,28 @@
+CmlSOFAudio
+Copyright (c) 2026 DexterSLamb
+Licensed under BSD-3-Clause (see LICENSE).
+
+This product includes and/or is derived from the following third-party
+components, each under its own license:
+
+1. Apple AudioServerPlugIn sample ("NullAudio")
+   File: plugin/CmlSOFAudioPlugin.c
+   This file is derived from Apple's NullAudio / SimpleAudioDriver
+   AudioServerPlugIn sample and remains subject to Apple's sample-code
+   license, reproduced verbatim at the top of that file.
+   Copyright (C) 2013 Apple Inc. All Rights Reserved.
+
+2. Sound Open Firmware (SOF) — Intel Comet Lake DSP firmware
+   File: kext/CmlSOFAudio/Firmware/sof-cml.ri
+   Intel Sound Open Firmware binary for Comet Lake, redistributed from
+   the linux-firmware project. This binary is embedded into the compiled
+   kext (see kext/CmlSOFAudio/sof_firmware_embed.s).
+   Licensed BSD-3-Clause. Full text: LICENSE.sof
+   Copyright (c) 2016 Intel Corporation. Copyright 2020 NXP.
+   Upstream: https://github.com/thesofproject/sof
+
+3. Hardware register / protocol references
+   Comments in the source attribute specific register values and SOF IPC /
+   topology wire-format values to the upstream Linux kernel drivers
+   (e.g. sound/soc/codecs/rt5682.c, sound/soc/sof/...). These are factual
+   descriptions of the hardware and the SOF ABI, not copied code.

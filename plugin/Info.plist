@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>LatSOFAudioPlugin</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.hackintosh.LatSOFAudioPlugin</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleVersion</key>
+	<string>2.0.0</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>C1030A0D-50F0-4A1D-B3E0-DEADBEEF0001</key>
+		<string>LatSOFAudio_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>C1030A0D-50F0-4A1D-B3E0-DEADBEEF0001</string>
+		</array>
+	</dict>
+</dict>
+</plist>

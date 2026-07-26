@@ -1,0 +1,30 @@
+# ---- build products ----
+*.o
+*.driver/
+*.kext/
+build/
+
+# ---- firmware: NOT redistributed (see README) ----
+# The kext embeds this at build time; supply it yourself.
+kext/LatSOFAudio/Firmware/*.ri
+*.ri
+
+# ---- backups and editor/OS noise ----
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
+*.bak-*
+*.orig
+*.rej
+*.swp
+.DS_Store
+
+# ---- NEVER COMMIT: contains real serials, and MSDM.aml holds a Windows OEM key
+config*.plist
+*.aml
+EFI/
+efi-configs/
+
+# ---- local artifacts ----
+*.wav
+ca-sample.txt
