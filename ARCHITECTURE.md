@@ -34,9 +34,14 @@ from it.
   Chromebook where it owned the device) performed a GCTL reset during
   bring-up. Here that would destroy AppleHDA's state. It turns out the
   SOF firmware boots fine without it.
-- **Stream-descriptor partitioning.** The controller advertises 7 input
-  DMA engines (GCAP `0x9701`); AppleHDA uses SD0. This driver uses input
-  descriptor **SD1 with stream tag 2** and touches nothing else.
+- **Stream-descriptor partitioning.** GCAP `0x9701` advertises 7 input and 9
+  output DMA engines, so SD0–SD6 are input descriptors and SD7–SD15 output.
+  AppleHDA captures on SD0. This driver captures on input descriptor **SD1
+  with stream tag 2**, which is exclusively ours for the driver's lifetime.
+  It also **borrows SD7 — AppleHDA's first output engine — for the duration
+  of every firmware load**, because the DSP code loader has to run over an
+  output descriptor. That borrow is the most dangerous thing this driver
+  does; see "The borrowed-stream contract" below.
 - **Per-stream decoupling only.** `PPCTL` is written to decouple SD1 into
   DSP mode exactly once at capture start, and it is re-coupled at stop.
   Bit 0 (AppleHDA's SD0) is never touched. An early version of this code
@@ -177,12 +182,68 @@ The fix is to enable nothing and clear the latched status at both ends.
 Position has always come from polling DPIB, so nothing depended on those
 interrupts existing.
 
+## The borrowed-stream contract
+
+The other rule that costs playback rather than capture, and the one that took
+longest to find. Read this before changing anything in `initDSP()`.
+
+The DSP's ROM code loader transfers firmware over an HDA output stream. The
+driver picks `SD(numISS)` — SD7 here — which is **AppleHDA's first output
+engine**. There is no arbitration protocol between two independent macOS
+drivers, so this is a genuine loan of live hardware: we take a descriptor
+AppleHDA owns, reprogram it, run DMA on it, and must hand it back exactly.
+
+Moving the loader elsewhere looks tempting and was tried. It failed at cold
+boot, and the reason is worth recording because it was initially misread as
+"the hardware demands SD7": the attempt changed the descriptor index but left
+the **stream tag** at 1 — and AppleHDA drives SD7 with tag 1 as well. The ROM
+binds its code-load gateway by *tag*, not by descriptor index, so that put two
+output descriptors on one tag. Relocating the loader may well be viable, but
+only if the tag moves with it.
+
+Given the loan is unavoidable, the contract is:
+
+> **Snapshot once, restore once, never write the descriptor again.**
+
+Concretely, in `initDSP()`: `SdSnapshot` captures `CTL`/`CBL`/`LVI`/`FMT`/`BDL`
+plus the shared `PPCTL` and SPIB state before the loader touches anything, and
+`sdRestore()` — idempotent, guarded by a `restored` flag — puts it back. It is
+called on the normal path *and* from `cleanup:`, so the ROM-IPC and INIT_DONE
+timeout paths, which jump straight over the normal hand-back, cannot leave
+AppleHDA's descriptor pointing at our firmware buffer.
+
+**Why this is easy to get wrong.** Cold boot forgives every violation. At boot
+SD7 is unprogrammed (`ctl=0x040000 fmt=0x0000 bdl=0 cbl=0 lvi=0`) — there is
+nothing there to damage, and AppleHDA configures it *after* us. On a wake it is
+fully live (`ctl=0x140000 fmt=0x4031 bdl=0x1f1d9000 cbl=393216 lvi=95`), and
+anything written after the hand-back destroys a running playback engine. So the
+bug is invisible until the machine sleeps, and it manifests in a driver you did
+not write.
+
+**Verify with `SD-Final`, never with `SD-Return`.** `SD-Return` is published
+immediately after the hand-back, while the function still has work to do — for
+a week it faithfully reported a perfect restore on wakes where the speakers
+were already dead, because the code that killed them ran later. `SD-Final` is
+read after the last write the function makes to the descriptor, and must match
+`SD-Borrow` field for field:
+
+```sh
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "SD-Borrow|SD-Final"
+```
+
+If those two ever disagree, something wrote SD7 after the hand-back, and the
+differing field names it. No inference required.
+
 ## What was measured
 
 - Capture DMA advances at exactly real-time rate (241k frames in 5.02 s).
 - 100 % nonzero samples, both channels live, on the first successful run.
 - Speaker playback verified working *during* capture (shared-function
   coexistence) and after stop.
-- Sleep/wake: the kext rebuilds the DSP on wake; recording works after a
-  lid-close cycle.
+- Sleep/wake: the kext rebuilds the DSP on wake, and the borrowed output
+  descriptor comes back byte-identical. Verified over a cold boot plus four
+  sleep/wake cycles — `SD-Borrow == SD-Final` on every one, all four with SD7
+  fully configured by AppleHDA, covering both AC software sleep and battery
+  clamshell sleep. Mic and speakers working after each; the mic confirmed from
+  non-zero `Capture-Stop` ring data rather than by ear.
 - Plugin runs under stock AMFI with no library-validation exceptions.

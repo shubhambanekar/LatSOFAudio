@@ -9,7 +9,8 @@ presented as symptoms in a completely different subsystem. If you are porting
 this to another Comet Lake machine, the failures will be more useful to you
 than the architecture.
 
-Two days, roughly twenty hours.
+Three days. Two to get it working, one more to find out it did not survive
+sleep — Phase 13 is that day, and it is the one most worth reading.
 
 ---
 
@@ -325,6 +326,80 @@ that returns an impossible result is telling you about itself.
 
 ---
 
+## Phase 13 — The telemetry that lied
+
+The driver was declared finished at the end of Phase 12. Then it went to sleep.
+
+After any sleep, audio broke. *Which* audio varied between wakes — sometimes
+the mic, sometimes the speakers, sometimes both. A reboot always restored
+everything. Worth separating two bugs here: the original failure was mic-only
+and speakers survived; speaker failure appeared **later**, introduced by
+patches that made wake-time re-init actually succeed. Succeeding is what
+reached the code that did the damage.
+
+Eight patches went in over a day: wait for `GCAP` to decode before deriving
+anything from it, walk the PCI PM capability and force D0, wait for AppleHDA to
+bring the link out of reset and then settle, save and restore the borrowed
+stream, stop clobbering AppleHDA's `INTCTL` bit, re-map the BARs on wake,
+replace the single synchronous wake attempt with a retry engine driven off the
+existing 500 ms timer. Each was individually defensible. Several were necessary.
+None of them fixed it.
+
+By the end of that day the retry engine reported first-try success, a clean
+borrow and restore, and `Status OK` on **every** wake — and audio still failed,
+in three different combinations across four wakes. Two of the patches required
+booting Windows to recover the machine.
+
+The mistake was structural, and it is the transferable part: each patch was
+simultaneously the experiment and the cure. When one appeared to help there was
+no way to tell which of its changes did it, and the driver's own telemetry was
+the only instrument. So the next step was not another patch — it was reading
+the post-load path line by line, looking for writes rather than theorising about
+registers.
+
+There were three, all after the stream had been handed back:
+
+```c
+// Clean up FW loader state — NO GCTL reset (would break DSP DMA)
+if (spibCap) wr32(hda, spibCap + 0x04, 0);   // zeroes SPIB for ALL streams
+streamReset(hda, sd);                        // resets AppleHDA's SD7 again
+```
+
+and, further down, a `cleanup:` block zeroing `BDLPL`/`BDLPU`/`CBL`/`LVI`. That
+one is the real culprit, and it hid in plain sight for a reason worth
+internalising: **`cleanup:` is not only a `goto` target — the success path falls
+straight into it.** It reads as error handling. It ran on every successful init,
+wiping the DMA descriptor of a stream we had just promised to return untouched.
+The same block also ran on the two IPC-timeout paths, which `goto cleanup` and
+so jump clean over the hand-back entirely.
+
+And the reason a week of measurement pointed nowhere: `SD-Return`, the property
+reporting the restore, is written *immediately after* the restore — before all
+three of those. It reported a perfect hand-back, accurately, every time. The
+damage happened afterwards.
+
+The fix was not to delete three lines but to make the violation unrepresentable:
+snapshot into a struct, restore through one idempotent function called from
+every exit path, and add `SD-Final`, read after the last write the function
+makes. `SD-Borrow` and `SD-Final` must match field for field. Four sleep/wake
+cycles later — including one on battery through a clamshell close — they did.
+
+Two conclusions from earlier in the week also turned out to be wrong, which is
+its own lesson about how confidently a debugging session records things. "The
+loader cannot be moved off SD7, the hardware cares which descriptor carries the
+code load" was a stream-tag collision: the attempt moved the descriptor and left
+the tag at 1, which is the tag AppleHDA already drives SD7 with. And "the mic
+dies because coreaudiod holds a stale IO session" was untrue — macOS tears the
+input session down across sleep, so the re-arm written to fix it never fires.
+
+**Lesson:** telemetry that reports success proves only that the reporting line
+ran. If a function keeps working after it publishes a result, the result
+describes an intermediate state, not the outcome. Read the register *after* the
+last write, and when you borrow another driver's hardware, make the give-back
+idempotent and call it from every exit path — including the ones that fail.
+
+---
+
 ## If you are porting this
 
 Read `PORTING.md` for the procedure. From this log, the four things most likely
@@ -337,3 +412,8 @@ to cost you a day:
 3. Never start DMA at boot.
 4. Profile before theorising, and check whether the CPU you are looking at is
    actually yours.
+5. If you borrow a stream descriptor another driver owns — and the code loader
+   forces you to — snapshot it, restore it through one idempotent function
+   called from every exit path, and verify by re-reading the descriptor after
+   your last write to it. Cold boot forgives every mistake here, because the
+   descriptor is still empty; the machine has to sleep before the bug exists.

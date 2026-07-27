@@ -21,11 +21,23 @@ to achieve and which attempts failed; this is the condensed index.
 | 12 | DC-blocking high-pass in the HAL plugin, applied before software gain so the offset never consumes headroom |
 | 13 | Hardware-disciplined timestamps. **Did not fix the bug it was written for** - retained because it is the correct design regardless |
 | 14 | The actual fix: stream-descriptor interrupts were enabled but never serviced, throttling the interrupt line AppleHDA depends on |
+| 15-22 | Wake-time re-init hardening after audio was found not to survive sleep: wait for `GCAP` to decode, force D0 via the PCI PM capability, let AppleHDA bring the link up first, save/restore the borrowed output descriptor, stop clobbering AppleHDA's `INTCTL` bit, re-map BARs on wake, drive re-init from a retry engine. Individually defensible, several necessary - **none of them fixed the sleep bug** |
+| 23 | Written, never applied. Correctly identified one of the three post-restore writes, but not the `cleanup:` block, so it would not have fixed it either |
+| 24 | The actual fix: the borrowed-stream contract - snapshot once, restore once through an idempotent function called from every exit path, and verify with `SD-Final` read after the last write rather than `SD-Return` written before it |
 
 The gap between 13 and 14 is the instructive part. 13 was a confident theory
 about clock drift that a profiler disproved in a single command; the real cause
 was two registers away, in what looked like a different subsystem entirely.
 
+15-22 repeat that shape at larger scale, and are worth reading as a group. Eight
+patches, each one simultaneously the experiment and the cure, against a bug
+whose only instrument was the driver's own telemetry - telemetry that turned out
+to be reporting an intermediate state. The step that actually worked was reading
+the post-load path for *writes* instead of theorising about registers.
+
 `FORK-NOTES.md` here is the original milestone-1 plan, kept as written at the
 time. Several of its "still to do" items were answered later - notably that the
-global `GCTL` reset turned out to be unnecessary.
+global `GCTL` reset turned out to be unnecessary, and that its plan to put the
+code loader on SD1 is not what happened: SD1 became the capture stream, and the
+loader runs on SD7, which is AppleHDA's. See "The borrowed-stream contract" in
+`ARCHITECTURE.md`.
