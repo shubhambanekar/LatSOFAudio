@@ -1498,8 +1498,12 @@ void LatSOFAudioDevice::shutdownDSPGated() {
     // Silence first, teardown second — prevents the DMA-ring-loop artefact.
     fastMute();
 
-    // Stop playback if running (already on workloop, call gated form directly).
+    // Stop our own streams if running (already on workloop, call gated forms
+    // directly). Capture matters as much as playback here: powering the DSP
+    // cores down underneath a running capture DMA leaves the engine reading
+    // from a dead pipeline.
     if (isPlaying) stopPlaybackGated();
+    if (isCapturing) stopCaptureGated();
 
     // Disable IPC interrupts
     wr32(dspBase, IPC_HIPCCTL, 0);
@@ -1513,16 +1517,23 @@ void LatSOFAudioDevice::shutdownDSPGated() {
     }
     poll32(dspBase, DSP_ADSPCS, ADSPCS_CPA(0xF), 0, 50000);
 
-    // Disable PPCTL
-    if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL, 0);
-
-    // Stop all streams, clear INTCTL
-    wr32(hdaBase, HDA_INTCTL, 0);
-
-    // Assert HDA controller link reset
-    wr32(hdaBase, HDA_GCTL, rd32(hdaBase, HDA_GCTL) & ~1U);
-    for (int t = 0; t < 100; t++) { if (!(rd32(hdaBase, HDA_GCTL) & 1)) break; IODelay(1000); }
-
+    // LATITUDE FORK patch-25: everything above this point is BAR4 — the DSP,
+    // which is exclusively ours. What used to follow was three writes to
+    // BAR0, which is AppleHDA's:
+    //
+    //     if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL, 0);   // shared register
+    //     wr32(hdaBase, HDA_INTCTL, 0);                    // ALL its int enables
+    //     wr32(hdaBase, HDA_GCTL, rd32(...) & ~1U);        // global link reset
+    //
+    // The last one is the exact thing rule 1 of the coexistence design
+    // forbids, and the first two blanket-write registers we are only ever
+    // allowed to read-modify-write. Inherited from the reference driver,
+    // which owned the device and could legitimately do all three.
+    //
+    // Nothing here needs them. The stream teardown above already cleared our
+    // own SDCTL/SDSTS and re-coupled our PPCTL bit; the DSP is powered down
+    // through BAR4. Resetting the shared controller only ever meant taking
+    // AppleHDA's streams down with us.
     hwReady = false;
 }
 
@@ -2193,13 +2204,25 @@ IOReturn LatSOFAudioDevice::s_stopCapture  (OSObject *o, void *, void *, void *,
     return static_cast<LatSOFAudioDevice *>(o)->stopCaptureGated();
 }
 
+// LATITUDE FORK patch-25: playback is not implemented on this board and these
+// entry points are refused rather than removed — the HAL plugin dispatches by
+// selector number, so the numbering must stay exactly as it is.
+//
+// This is not merely unused code, it is actively hazardous. This fork has no
+// I2S codecs, so initI2C() returns early and i2cBase is permanently NULL. That
+// forces useHeadphone = false in startPlaybackGated, which selects
+// PIPE7_HOST_ID — a pipeline this fork deletes from the topology. PCM_PARAMS to
+// a component the firmware has never heard of times out, and the timeout path
+// called shutdownDSPGated(), which until patch-25 asserted the global GCTL
+// reset. One call to selector 0 from any process would therefore have taken
+// AppleHDA's audio down completely.
+//
+// The plugin is input-only and never calls these; nothing else does either.
 IOReturn LatSOFAudioDevice::startPlayback() {
-    if (!commandGate) return kIOReturnNotReady;
-    return commandGate->runAction(&s_startPlayback);
+    return kIOReturnUnsupported;
 }
 IOReturn LatSOFAudioDevice::stopPlayback() {
-    if (!commandGate) return kIOReturnNotReady;
-    return commandGate->runAction(&s_stopPlayback);
+    return kIOReturnUnsupported;
 }
 IOReturn LatSOFAudioDevice::startCapture() {
     if (!commandGate) return kIOReturnNotReady;

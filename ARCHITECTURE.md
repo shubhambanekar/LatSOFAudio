@@ -33,7 +33,14 @@ from it.
 - **No global controller reset.** The reference driver (written for a
   Chromebook where it owned the device) performed a GCTL reset during
   bring-up. Here that would destroy AppleHDA's state. It turns out the
-  SOF firmware boots fine without it.
+  SOF firmware boots fine without it. Note that removing it from bring-up
+  was not sufficient: a second GCTL reset survived in `shutdownDSPGated()`,
+  the playback error-recovery path, together with blanket writes of `INTCTL`
+  and `PPCTL` — reachable from any `StartPlayback` call, which on this board
+  is guaranteed to fail (no I2S codec, so it selects a pipeline this fork
+  deletes from the topology). Removed, and playback selectors now refuse.
+  If you derive from the same reference, grep for *every* `GCTL` write, not
+  just the one in the init path.
 - **Stream-descriptor partitioning.** GCAP `0x9701` advertises 7 input and 9
   output DMA engines, so SD0–SD6 are input descriptors and SD7–SD15 output.
   AppleHDA captures on SD0. This driver captures on input descriptor **SD1
