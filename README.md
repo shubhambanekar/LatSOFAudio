@@ -101,6 +101,40 @@ header. Use `LatSOFAudioDevice` when querying the driver with `ioreg`.
   relaxed (OCLP-patched Wi-Fi is the usual culprit), use
   [AMFIPass](https://github.com/dortania/OpenCore-Legacy-Patcher) instead.
 
+## Reference hardware
+
+Everything in this repository was developed and tested on exactly one machine.
+If yours differs, `PORTING.md` §0 is the five-minute Linux check that matters
+far more than matching this list.
+
+| | |
+|---|---|
+| Model | Dell Latitude 3410 (SKU `09EC`), board `0MYG77` rev A00 |
+| BIOS | 1.36.0, 07 Aug 2025 |
+| CPU | Intel Core i5-10210U — Comet Lake-U, 4 cores / 8 threads, 1.60 GHz base |
+| Host bridge | Comet Lake-U v1 4c `[8086:9b61]` |
+| Graphics | Intel UHD Graphics, CometLake-U GT2 `[8086:9b41]` — **integrated only, no discrete GPU** |
+| Memory | 2 × 8 GB DDR4-2400 (16 GB) |
+| Audio controller | Comet Lake PCH-LP cAVS `[8086:02c8]`, subsystem `[1028:09ec]` |
+| Codec | Realtek ALC3204 (ALC236 family, `[10ec:0236]`) at HDA address 0 |
+| Microphones | 2 × PDM DMIC on one PDM controller, wired to the DSP — **not to the codec** |
+| Storage | SanDisk WD PC SN5000S M.2 2280 NVMe `[15b7:5036]` |
+| Ethernet | Realtek RTL8111/8168 `[10ec:8168]` |
+| Wi-Fi / BT | Intel Wi-Fi 6 AX201 (CNVi) `[8086:02f0]`, subsystem `[8086:4070]` |
+| macOS | Sequoia 15.7.7 (24G720) |
+| SMBIOS | `MacBookPro16,2` |
+
+The two rows that actually decide whether this project applies to you are
+**Microphones** and **Codec**. On this board the ALC236 has no analog
+microphone pin at all, so the only path to the internal mics is through the
+DSP — which is the entire reason this driver exists. A machine with the same
+CPU but mics wired to the codec does not need any of this.
+
+The graphics row is listed because it is the usual follow-up question: this is
+a pure-iGPU laptop, no dGPU to disable or spoof, and the `-igfx*` boot-args in
+`INSTALL.md` are WhateverGreen options for the UHD Graphics, unrelated to
+audio.
+
 ## Firmware — you must supply this yourself
 
 `sof-cml.ri` is **not distributed here**. The kext embeds it at build time, so
