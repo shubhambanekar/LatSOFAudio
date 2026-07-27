@@ -288,6 +288,21 @@ static bool gWakeReinitPending = false;
 static int  gWakeTries = 0;
 static int  gWakeTickDivider = 0;
 
+// LATITUDE FORK patch-24: capture re-arm across sleep.
+//
+// The HAL plugin has no wake awareness at all — no interest notification, no
+// reconnect — and its gDevice_IOIsRunning counter survives sleep. It only
+// issues kLatSOF_StartCapture on the 0->1 transition in StartIO, so if an app
+// held an input session across the sleep, StartIO never fires again and the
+// capture DMA is never restarted: mic dead until something reopens the device.
+// If nothing was recording, the next app's StartIO does a fresh StartCapture
+// and the mic works — which is exactly why the mic failure looked intermittent.
+//
+// The kext has to close this itself: the plugin is ad-hoc signed and currently
+// rejected by AMFI, so a plugin-side fix cannot ship independently. We latch
+// whether capture was live at sleep and reissue it once wake re-init succeeds.
+static bool gWasCapturing = false;
+
 static bool poll32(volatile UInt8 *b, UInt32 o, UInt32 mask, UInt32 val, UInt32 usec) {
     for (UInt32 t = 0; t < usec; t += 500) {
         if ((rd32(b, o) & mask) == val) return true;
@@ -304,6 +319,49 @@ static void streamReset(volatile UInt8 *hda, UInt32 sd) {
     wr8(hda, sd, 0);
     for (int t = 0; t < 300; t++) { if (!(rd8(hda, sd) & SD_CTL_SRST)) break; IODelay(10); }
     wr8(hda, sd + SD_REG_STS, 0x1C);
+}
+
+// LATITUDE FORK patch-24: the borrowed-stream contract.
+//
+// SD(numISS) — SD7 here — is AppleHDA's first output engine, and the code
+// loader has to drive it. Borrowing is therefore unavoidable, so it has to be
+// exact: snapshot once, restore once, and never write the descriptor again.
+//
+// Every sleep/wake failure this driver has had traces back to that contract
+// being broken *after* the restore ran, and after the telemetry that claimed
+// the restore had succeeded — so the reports read "restored" on wakes where
+// the speakers were already dead. Two later blocks re-reset the stream and
+// zeroed its BDL/CBL/LVI, and the two early failure paths jumped clean over
+// the restore and left the descriptor pointing at our firmware buffer.
+//
+// Making the restore idempotent and callable from every exit path is what
+// turns "we remembered to put it back this time" into an invariant: the last
+// write this driver ever makes to the borrowed descriptor is AppleHDA's own
+// state, on success and on every failure alike.
+struct SdSnapshot {
+    UInt32 ppctl, spibEn, spibVal, ctl, cbl, bdpl, bdpu;
+    UInt16 lvi, fmt;
+    bool   valid;      // snapshot was taken — nothing to give back without it
+    bool   restored;   // already handed back — makes repeat calls a no-op
+};
+
+static void sdRestore(volatile UInt8 *hda, UInt32 sd, UInt32 sIdx,
+                      UInt32 ppCap, UInt32 spibCap, SdSnapshot &s) {
+    if (!s.valid || s.restored) return;
+    s.restored = true;
+    streamReset(hda, sd);
+    wr32(hda, sd + SD_REG_BDLPL, s.bdpl);
+    wr32(hda, sd + SD_REG_BDLPU, s.bdpu);
+    wr32(hda, sd + SD_REG_CBL,   s.cbl);
+    wr16(hda, sd + SD_REG_LVI,   s.lvi);
+    wr16(hda, sd + SD_REG_FMT,   s.fmt);
+    wr16(hda, sd,     (UInt16)(s.ctl & 0xFFFF));
+    wr8(hda, sd + 2,  (UInt8)((s.ctl >> 16) & 0xFF));
+    if (spibCap) {
+        wr32(hda, spibCap + 0x08 + sIdx * 0x08, s.spibVal);
+        wr32(hda, spibCap + 0x04, s.spibEn);
+    }
+    if (ppCap) wr32(hda, ppCap + PP_PPCTL, s.ppctl);
 }
 
 // Power states for sleep/wake
@@ -818,10 +876,7 @@ bool LatSOFAudioDevice::initDSP() {
         // stream we are about to borrow. Declared here, not at the point of
         // use, because the goto targets below would jump past the
         // initialisation otherwise.
-        UInt32 savPPCTL = 0, savSPIBEn = 0, savSPIBVal = 0;
-        UInt32 savCTL = 0, savCBL = 0, savBDPL = 0, savBDPU = 0;
-        UInt16 savLVI = 0, savFMT = 0;
-        bool   saved = false;
+        SdSnapshot snap = {};
         UInt32 fwSize = (UInt32)sof_fw_size;
         UInt32 payloadOffset = 0, payloadSize = 0;
         IOBufferMemoryDescriptor *fwBuf = nullptr, *bdlBuf = nullptr;
@@ -935,26 +990,26 @@ bool LatSOFAudioDevice::initDSP() {
         // The capture stream now decouples in startCaptureGated().
         // LATITUDE FORK patch-20: SD(sIdx) is AppleHDA's first output
         // engine. Borrow it rather than seize it — snapshot first.
-        savPPCTL   = ppCap   ? rd32(hda, ppCap + PP_PPCTL) : 0;
-        savSPIBEn  = spibCap ? rd32(hda, spibCap + 0x04) : 0;
-        savSPIBVal = spibCap ? rd32(hda, spibCap + 0x08 + (UInt32)sIdx * 0x08) : 0;
-        savCTL     = rd32(hda, sd) & 0x00FFFFFF;   // CTL only, never SDSTS
-        savCBL     = rd32(hda, sd + SD_REG_CBL);
-        savLVI     = rd16(hda, sd + SD_REG_LVI);
-        savFMT     = rd16(hda, sd + SD_REG_FMT);
-        savBDPL    = rd32(hda, sd + SD_REG_BDLPL);
-        savBDPU    = rd32(hda, sd + SD_REG_BDLPU);
-        saved      = true;
+        snap.ppctl   = ppCap   ? rd32(hda, ppCap + PP_PPCTL) : 0;
+        snap.spibEn  = spibCap ? rd32(hda, spibCap + 0x04) : 0;
+        snap.spibVal = spibCap ? rd32(hda, spibCap + 0x08 + (UInt32)sIdx * 0x08) : 0;
+        snap.ctl     = rd32(hda, sd) & 0x00FFFFFF;   // CTL only, never SDSTS
+        snap.cbl     = rd32(hda, sd + SD_REG_CBL);
+        snap.lvi     = rd16(hda, sd + SD_REG_LVI);
+        snap.fmt     = rd16(hda, sd + SD_REG_FMT);
+        snap.bdpl    = rd32(hda, sd + SD_REG_BDLPL);
+        snap.bdpu    = rd32(hda, sd + SD_REG_BDLPU);
+        snap.valid   = true;
         { char b[80];
           snprintf(b, sizeof(b), "sd%d ctl=0x%06x fmt=0x%04x bdl=0x%08x ppctl=0x%08x",
-                   sIdx, savCTL, savFMT, savBDPL, savPPCTL);
+                   sIdx, snap.ctl, snap.fmt, snap.bdpl, snap.ppctl);
           setProperty("SD-Borrow", b); }
 
         // PPCTL as read-modify-write: the original assigned the whole
         // register and so erased AppleHDA's decouple bits outright.
         if (ppCap)
             wr32(hda, ppCap + PP_PPCTL,
-                 savPPCTL | (1U << 31) | PP_PPCTL_GPROCEN | (1U << sIdx) | (1U << (sIdx + 1)));
+                 snap.ppctl | (1U << 31) | PP_PPCTL_GPROCEN | (1U << sIdx) | (1U << (sIdx + 1)));
 
         // Program code loader stream
         streamReset(hda, sd);
@@ -1040,25 +1095,11 @@ bool LatSOFAudioDevice::initDSP() {
         // the fwLoaded check on purpose — a FAILED load used to leave
         // AppleHDA's playback engine pointing at our firmware buffer with
         // its format and BDL wiped, which is what killed the speakers.
-        if (saved) {
-            streamReset(hda, sd);
-            wr32(hda, sd + SD_REG_BDLPL, savBDPL);
-            wr32(hda, sd + SD_REG_BDLPU, savBDPU);
-            wr32(hda, sd + SD_REG_CBL,   savCBL);
-            wr16(hda, sd + SD_REG_LVI,   savLVI);
-            wr16(hda, sd + SD_REG_FMT,   savFMT);
-            wr16(hda, sd,     (UInt16)(savCTL & 0xFFFF));
-            wr8(hda, sd + 2,  (UInt8)((savCTL >> 16) & 0xFF));
-            if (spibCap) {
-                wr32(hda, spibCap + 0x08 + (UInt32)sIdx * 0x08, savSPIBVal);
-                wr32(hda, spibCap + 0x04, savSPIBEn);
-            }
-            if (ppCap) wr32(hda, ppCap + PP_PPCTL, savPPCTL);
-            { char b[64];
-              snprintf(b, sizeof(b), "restored ctl=0x%06x ppctl=0x%08x",
-                       rd32(hda, sd) & 0x00FFFFFF, ppCap ? rd32(hda, ppCap + PP_PPCTL) : 0);
-              setProperty("SD-Return", b); }
-        }
+        sdRestore(hda, sd, (UInt32)sIdx, ppCap, spibCap, snap);
+        { char b[64];
+          snprintf(b, sizeof(b), "restored ctl=0x%06x ppctl=0x%08x",
+                   rd32(hda, sd) & 0x00FFFFFF, ppCap ? rd32(hda, ppCap + PP_PPCTL) : 0);
+          setProperty("SD-Return", b); }
 
         if (!fwLoaded) { setProperty("Status", "FAILED: FW load"), IOLog("LatSOF: %s\n", "FAILED: FW load"); goto cleanup; }
 
@@ -1163,9 +1204,14 @@ bool LatSOFAudioDevice::initDSP() {
                     return (replyErr != 0) ? replyErr : 0;
                 };
 
-                // Clean up FW loader state — NO GCTL reset (would break DSP DMA)
-                if (spibCap) wr32(hda, spibCap + 0x04, 0);
-                streamReset(hda, sd);
+                // LATITUDE FORK patch-24: loader cleanup DELETED. It ran after
+                // sdRestore had already handed AppleHDA's SD7 back and after
+                // SD-Return was written, so it reset the stream a second time
+                // and zeroed every stream's SPIB enable — which is why the
+                // speakers died on wakes where the telemetry read "restored".
+                // The loader-stop path plus sdRestore already leave the
+                // descriptor and SPIB exactly as AppleHDA had them; per the
+                // borrowed-stream contract nothing may write SD7 past here.
 
                 // LATITUDE FORK: diagnose ext_data, then prove the downlink mailbox.
                 {
@@ -1338,14 +1384,47 @@ setProperty("Status", "Ready for UserClient"), IOLog("LatSOF: %s\n", "Ready for 
             }
         }
 
+        // LATITUDE FORK patch-24: restore the poll-only doctrine. The loader
+        // turned on the DSP->host interrupt for the ROM handshake (HIPCCTL,
+        // ADSPIC bit 0) and the success path never turned it back off, so any
+        // later firmware notification could assert the line we share with
+        // AppleHDA — with no handler on our side to service it. Every IPC here
+        // polls HIPCIDA, so nothing needs these enabled. ADSPIC is the master
+        // enable and nothing re-arms it after init; HIPCCTL bit 1 does get set
+        // again by later IPC sends, which is harmless while ADSPIC is clear.
+        wr32(dsp, DSP_ADSPIC, 0);
+        wr32(dsp, IPC_HIPCCTL, 0);
+
         setProperty("Status", "OK"), IOLog("LatSOF: %s\n", "OK");
 
     cleanup:
-        if (spibCap) wr32(hda, spibCap + 0x04, rd32(hda, spibCap + 0x04) & ~(1U << sIdx));
-        wr32(hda, sd + SD_REG_BDLPL, 0); wr32(hda, sd + SD_REG_BDLPU, 0);
-        wr32(hda, sd + SD_REG_CBL, 0); wr16(hda, sd + SD_REG_LVI, 0);
+        // LATITUDE FORK patch-24: this label is not only a goto target — the
+        // success path falls straight into it. The old body zeroed BDLPL,
+        // BDLPU, CBL and LVI on AppleHDA's descriptor, after the restore and
+        // after SD-Return had been written, wiping the DMA descriptor of a
+        // stream we had just promised to hand back untouched. It also ran on
+        // the ROM-IPC and INIT_DONE timeout paths, which jump over the normal
+        // hand-back entirely and so left SD7 pointing at our firmware buffer.
+        //
+        // Now every exit lands on the same idempotent restore: a no-op after a
+        // successful init, and the only thing that puts the stream back after
+        // a failed one.
+        sdRestore(hda, sd, (UInt32)sIdx, ppCap, spibCap, snap);
         if (bdlBuf) { bdlBuf->complete(); bdlBuf->release(); }
         if (fwBuf) { fwBuf->complete(); fwBuf->release(); }
+        // Proof of the contract, read after the last write this function makes
+        // to the borrowed descriptor. SD-Final must match SD-Borrow field for
+        // field; if it ever doesn't, something wrote SD7 after the hand-back
+        // and that is the bug — no inference needed.
+        { char f[128];
+          snprintf(f, sizeof(f),
+                   "sd%d ctl=0x%06x fmt=0x%04x bdl=0x%08x cbl=%u lvi=%u ppctl=0x%08x spiben=0x%08x",
+                   sIdx, rd32(hda, sd) & 0x00FFFFFF, rd16(hda, sd + SD_REG_FMT),
+                   rd32(hda, sd + SD_REG_BDLPL), rd32(hda, sd + SD_REG_CBL),
+                   (unsigned)rd16(hda, sd + SD_REG_LVI),
+                   ppCap ? rd32(hda, ppCap + PP_PPCTL) : 0,
+                   spibCap ? rd32(hda, spibCap + 0x04) : 0);
+          setProperty("SD-Final", f); }
     }
 
 done:
@@ -1454,6 +1533,9 @@ void LatSOFAudioDevice::shutdownForSleepGated() {
     // State reset only. PCI D3 (driven by IOKit PM after we return) powers
     // down DSP + HDA. Wake calls initDSP() to fully rebuild — any IPC or
     // HDA-reset polls we did here would be thrown away on wake anyway.
+    // patch-24: remember a live capture session so wake can re-arm it. The
+    // plugin will not ask again on its own — see gWasCapturing.
+    gWasCapturing = isCapturing;
     hwReady = false;
     isPlaying = false;
     isCapturing = false;
@@ -1613,8 +1695,21 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 gWakeReinitPending = false;
                 setProperty("Wake-Retry-Done", "OK"),
                     IOLog("LatSOF: %s\n", "wake re-init OK");
+                // patch-24: the plugin will not re-issue StartCapture on its
+                // own, so a session that was live at sleep has to be restarted
+                // here. Already on the workloop — call the gated form directly,
+                // exactly as the jack-change path below does.
+                if (gWasCapturing) {
+                    gWasCapturing = false;
+                    IOReturn cr = startCaptureGated();
+                    setProperty("Wake-Capture-Rearm",
+                                (cr == kIOReturnSuccess) ? "OK" : "FAILED");
+                    IOLog("LatSOF: wake capture re-arm %s\n",
+                          (cr == kIOReturnSuccess) ? "OK" : "FAILED");
+                }
             } else if (gWakeTries >= 12) {
                 gWakeReinitPending = false;
+                gWasCapturing = false;   // stale latch must not fire on a later wake
                 setProperty("Wake-Retry-Done", "GAVE UP after 12 tries"),
                     IOLog("LatSOF: %s\n", "wake re-init gave up after 12 tries");
             }
