@@ -61,7 +61,11 @@ Two components:
    `IOResources` and locates the HDA controller by registry walk, so
    **AppleHDA keeps working** — speakers, headphones and AppleALC are
    untouched. The two drivers share the controller by partitioning stream
-   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2).
+   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2),
+   with one carefully-managed exception: during each firmware load the code
+   loader briefly borrows AppleHDA's first output descriptor and hands it
+   back byte-identical (see the FAQ, and "The borrowed-stream contract" in
+   `ARCHITECTURE.md`).
 
 2. **`LatSOFAudioPlugin.driver`** — a userspace CoreAudio HAL plugin
    (input-only) that maps the kext's capture ring and publishes
@@ -195,9 +199,14 @@ what your working OpenCore setup already does. Do **not** add
 `amfi=0x80` — it breaks microphone permission prompts system-wide.
 
 **Will this break my speakers?** Using it: no — coexisting with AppleHDA
-is the entire design, and the driver enables no interrupts and never
-touches AppleHDA's stream. Modifying the interrupt code can: see Safety
-notes and `ARCHITECTURE.md` first.
+is the entire design. The driver services no interrupts, and the one shared
+resource it uses — AppleHDA's first output stream descriptor, which the
+DSP's code loader currently runs over during every firmware load — is
+borrowed under a strict snapshot/restore contract and verified
+byte-identical afterwards (the `SD-Borrow`/`SD-Final` ioreg properties).
+Modifying the interrupt code or the borrow/restore path can absolutely
+break playback: read "The interrupt-starvation bug" and "The
+borrowed-stream contract" in `ARCHITECTURE.md` first.
 
 **Other macOS versions?** Sequoia 15.x is what's tested. Reports from
 other versions are welcome.

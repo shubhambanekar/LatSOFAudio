@@ -908,9 +908,19 @@ bool LatSOFAudioDevice::initDSP() {
         {
             const UInt32 kLoaderStream = 1;   // SD0 belongs to AppleHDA
             UInt32 sdOff = SD_BASE + kLoaderStream * SD_SIZE;
-            wr32(hda, sdOff + SD_REG_STS, 0x1C);          // our stream only
-            UInt32 ic = rd32(hda, HDA_INTCTL);            // preserve existing
-            wr32(hda, HDA_INTCTL, ic | (1U << 31) | (1U << 30));
+            // patch-26: wr8, not wr32 — SDSTS is a byte register at +0x03,
+            // and the old 32-bit write was misaligned, spanning into the
+            // neighbouring read-only bytes. Worked on this chipset; still
+            // wrong. streamReset() has always used wr8 here.
+            wr8(hda, sdOff + SD_REG_STS, 0x1C);           // our stream only
+            // patch-26: the INTCTL GIE/CIE enable that used to follow is
+            // deleted. Since patch-18 removed IOCE/SIE from the loader,
+            // nothing on our side services or needs any HDA interrupt —
+            // poll-only means poll-only at the controller level too. Setting
+            // the global enables was harmless only while AppleHDA also had
+            // them set; if a retry fired while AppleHDA was mid-restore with
+            // GIE deliberately clear, we would have un-gated its latched
+            // interrupts at a moment the owner did not expect.
         }
 
         // Re-enable misc clock gating (PCI CGCTL bit 6)
@@ -1384,20 +1394,21 @@ setProperty("Status", "Ready for UserClient"), IOLog("LatSOF: %s\n", "Ready for 
             }
         }
 
-        // LATITUDE FORK patch-24: restore the poll-only doctrine. The loader
-        // turned on the DSP->host interrupt for the ROM handshake (HIPCCTL,
-        // ADSPIC bit 0) and the success path never turned it back off, so any
-        // later firmware notification could assert the line we share with
-        // AppleHDA — with no handler on our side to service it. Every IPC here
-        // polls HIPCIDA, so nothing needs these enabled. ADSPIC is the master
-        // enable and nothing re-arms it after init; HIPCCTL bit 1 does get set
-        // again by later IPC sends, which is harmless while ADSPIC is clear.
-        wr32(dsp, DSP_ADSPIC, 0);
-        wr32(dsp, IPC_HIPCCTL, 0);
-
         setProperty("Status", "OK"), IOLog("LatSOF: %s\n", "OK");
 
     cleanup:
+        // LATITUDE FORK patch-26: restore the poll-only doctrine — HERE, not
+        // above the label. The loader turned on the DSP->host interrupt for
+        // the ROM handshake (HIPCCTL = 0x03, ADSPIC |= 1); patch-24 masked it
+        // again, but placed the masks on the success path only, so every
+        // "goto cleanup" (ROM IPC, INIT_DONE, FW load timeouts) exited with
+        // the interrupt fully armed on the line we share with AppleHDA — and
+        // a firmware that finished entering just after our 3 s poll gave up
+        // would assert it with no handler anywhere. The same off-by-one-label
+        // mistake patch-24 itself fixed for the stream restore. Every IPC in
+        // this driver polls HIPCIDA; nothing ever needs these enabled.
+        wr32(dsp, DSP_ADSPIC, 0);
+        wr32(dsp, IPC_HIPCCTL, 0);
         // LATITUDE FORK patch-24: this label is not only a goto target — the
         // success path falls straight into it. The old body zeroed BDLPL,
         // BDLPU, CBL and LVI on AppleHDA's descriptor, after the restore and
@@ -1450,7 +1461,8 @@ done:
 // the ring once or twice after fastMute() before it's throttled, so a
 // very short loop-tone (a few hundred ms) can be audible on short
 // clamshell. Acceptable — no deadlocks, no FAILED state, and on actual
-// system sleep shutdownDSPGated() does a proper graceful teardown.
+// system sleep shutdownForSleepGated() resets state (wake rebuilds the
+// DSP from scratch, so nothing more is needed on the way down).
 void LatSOFAudioDevice::fastMute() {
     if (i2cBase && isPlaying && activePlaybackHost == PIPE1_HOST_ID) {
         i2cWrite16(0x0002, 0x8080);   // HP_CTRL_1: mute L+R
@@ -1546,7 +1558,12 @@ void LatSOFAudioDevice::shutdownForSleepGated() {
     // HDA-reset polls we did here would be thrown away on wake anyway.
     // patch-24: remember a live capture session so wake can re-arm it. The
     // plugin will not ask again on its own — see gWasCapturing.
-    gWasCapturing = isCapturing;
+    // patch-26: OR, don't assign. A second sleep arriving before the retry
+    // round has re-armed (first attempt is ≥1.5 s after wake) used to
+    // overwrite a still-pending true latch with isCapturing == false — and
+    // the session the app is holding was lost on the second wake. The latch
+    // is now cleared only by a successful re-arm or an explicit StopCapture.
+    gWasCapturing = gWasCapturing || isCapturing;
     hwReady = false;
     isPlaying = false;
     isCapturing = false;
@@ -1559,7 +1576,12 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
         shutdownForSleepGated();
     } else {
         // Wake — full re-init (skip if already running, e.g. initial PM registration)
-        if (!hwReady && pciDevice && hdaBase && dspBase) {
+        // patch-26: do NOT require hdaBase/dspBase here. A failed remap on a
+        // previous wake nulls them, and the only code that can repair them is
+        // the remap block inside this very branch — gating on the pointers
+        // turned one transient remap failure into a driver that was dead
+        // until reboot, while its own comment promised "next wake retries".
+        if (!hwReady && pciDevice) {
             // PCI power cycle
             pciDevice->setBusMasterEnable(true);
             pciDevice->setMemoryEnable(true);
@@ -1658,12 +1680,25 @@ void LatSOFAudioDevice::stop(IOService *provider) {
         if (getWorkLoop()) getWorkLoop()->removeEventSource(jackTimer);
         jackTimer->release(); jackTimer = nullptr;
     }
+    // patch-26: stop our streams BEFORE PMstop. PMstop synchronously
+    // delivers setPowerState(0) → shutdownForSleepGated, which clears
+    // isPlaying/isCapturing without stopping DMA — correct for sleep,
+    // where PCI D3 follows and stops the engines; wrong for teardown,
+    // where nothing does. These calls used to sit after PMstop, where
+    // their guards were always already false: a kext unload during
+    // capture freed capDmaBuf below while SD1 was still DMA-writing into
+    // it. Routed through the gate (still installed at this point) because
+    // PM's setPowerState can arrive on the gated path until PMstop —
+    // "single-threaded in stop" is only true of what runs under the gate.
+    // The gated forms no-op on their own flags, so no guards needed here.
+    if (commandGate) {
+        commandGate->runAction(&s_stopPlayback);
+        commandGate->runAction(&s_stopCapture);
+    } else {
+        if (isPlaying) stopPlaybackGated();
+        if (isCapturing) stopCaptureGated();
+    }
     PMstop();
-    // PMstop already triggered setPowerState(0) → shutdownDSPGated, which
-    // already stopped playback/capture. Belt-and-braces: call gated forms
-    // directly (single-threaded in stop, safe without the gate).
-    if (isPlaying) stopPlaybackGated();
-    if (isCapturing) stopCaptureGated();
     if (commandGate) {
         if (getWorkLoop()) getWorkLoop()->removeEventSource(commandGate);
         commandGate->release();
@@ -1691,18 +1726,26 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
     if (gWakeReinitPending && !hwReady && pciDevice && hdaBase && dspBase) {
         if (++gWakeTickDivider >= 3) {            // one attempt per ~1.5 s
             gWakeTickDivider = 0;
-            gWakeTries++;
             bool busy = false;
             UInt16 g = rd16(hdaBase, HDA_GCAP);
-            if (g != 0xFFFF && g != 0x0000) {
+            bool decoding = (g != 0xFFFF && g != 0x0000);
+            if (decoding) {
                 UInt32 outSd = SD_BASE + (UInt32)((g >> 8) & 0xF) * SD_SIZE;
                 if (rd8(hdaBase, outSd) & SD_CTL_RUN) busy = true;  // AppleHDA playing — wait our turn
             }
+            // patch-26: only a real init attempt consumes the retry budget.
+            // gWakeTries++ used to run before the busy check, so music
+            // auto-resuming at wake for ~18 s burned all 12 rounds on "busy"
+            // and the engine gave up without ever calling initDSP — mic dead
+            // for the whole awake session. Waiting our turn is now free: the
+            // preflight is two register reads per 1.5 s, and the first quiet
+            // moment gets a genuine attempt.
+            if (decoding && !busy) gWakeTries++;
             { char w[64];
               snprintf(w, sizeof(w), "n=%d gcap=0x%04x %s",
-                       gWakeTries, g, busy ? "busy" : "try");
+                       gWakeTries, g, busy ? "busy" : (decoding ? "try" : "nodecode"));
               setProperty("Wake-Retry", w); }
-            if (!busy && g != 0xFFFF && g != 0x0000 && initDSP()) {
+            if (!busy && decoding && initDSP()) {
                 gWakeReinitPending = false;
                 setProperty("Wake-Retry-Done", "OK"),
                     IOLog("LatSOF: %s\n", "wake re-init OK");
@@ -1711,8 +1754,11 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 // here. Already on the workloop — call the gated form directly,
                 // exactly as the jack-change path below does.
                 if (gWasCapturing) {
-                    gWasCapturing = false;
                     IOReturn cr = startCaptureGated();
+                    // patch-26: consume the latch only on success. A failed
+                    // re-arm (one PCM_PARAMS timeout) now survives the next
+                    // sleep/wake instead of being forgotten.
+                    if (cr == kIOReturnSuccess) gWasCapturing = false;
                     setProperty("Wake-Capture-Rearm",
                                 (cr == kIOReturnSuccess) ? "OK" : "FAILED");
                     IOLog("LatSOF: wake capture re-arm %s\n",
@@ -1720,7 +1766,13 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 }
             } else if (gWakeTries >= 12) {
                 gWakeReinitPending = false;
-                gWasCapturing = false;   // stale latch must not fire on a later wake
+                // patch-26: the capture latch is deliberately NOT cleared
+                // here any more. Giving up means 12 genuine init attempts
+                // failed this wake; if the app still holds its session, the
+                // next sleep/wake preserves the latch (OR in
+                // shutdownForSleepGated) and a successful init then re-arms
+                // it. Staleness is handled where intent is unambiguous —
+                // stopCaptureGated clears the latch on any explicit stop.
                 setProperty("Wake-Retry-Done", "GAVE UP after 12 tries"),
                     IOLog("LatSOF: %s\n", "wake re-init gave up after 12 tries");
             }
@@ -2004,7 +2056,19 @@ IOReturn LatSOFAudioDevice::updateSPIB(UInt32 byteOffset) {
 // ==================== Capture Control ====================
 
 IOReturn LatSOFAudioDevice::startCaptureGated() {
-    if (!hwReady || !capDmaBuf || !capBdlBuf) return kIOReturnNotReady;
+    if (!hwReady || !capDmaBuf || !capBdlBuf) {
+        // patch-26: a refused start is a DEMAND, not a no-op. The plugin
+        // ignores this return, marks IO as running, and only re-issues
+        // StartCapture on its next 0->1 client transition — so a StartIO
+        // that lands in the not-ready wake window would otherwise be
+        // swallowed forever and the mic would stay silent all session.
+        // Latch it; the wake retry engine's re-arm serves it after the
+        // next successful init. Consumed only after initDSP() returns true, so
+        // this cannot start DMA before the hardware is ready — and never
+        // at boot, where the latch is only read by the wake path.
+        gWasCapturing = true;
+        return kIOReturnNotReady;
+    }
     if (isCapturing) return kIOReturnSuccess;
 
     UInt32 numBdl = (kLatSOF_CapBufferSize + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -2069,6 +2133,15 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       for (UInt32 i = 0; i < sizeof(pcm); i += 4) wr32(ob, i, *(UInt32*)((UInt8*)&pcm + i));
       wr32(dspBase, IPC_HIPCIDR, IPC_BUSY);
       if (!poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000)) {
+          // patch-26: re-couple SD1 before bailing. RUN is not set yet on
+          // this path, but the stream was decoupled above; leaving the
+          // PPCTL bit set contradicted the zero-steady-state-footprint
+          // rule and nothing else would ever clear it.
+          if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
+                          rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
+          // Same contract as the not-ready refusal above: the plugin
+          // swallows this return, so a timed-out start is a demand too.
+          gWasCapturing = true;
           return kIOReturnTimeout;
       }
       paramsErr = rd32(ob, 8);           // LATITUDE FORK: sof_ipc_reply.error
@@ -2100,6 +2173,18 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       for (UInt32 i = 0; i < 12; i += 4) wr32(ob, i, *(UInt32*)((UInt8*)&m + i));
       wr32(dspBase, IPC_HIPCIDR, IPC_BUSY);
       if (!poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000)) {
+          // patch-26: RUN was set a few lines up; returning with it still
+          // set left SD1 DMA looping into capDmaBuf with isCapturing ==
+          // false — a state stopCaptureGated's !isCapturing early-return
+          // could never converge, and a wake re-arm hitting this timeout
+          // produced exactly that. Stop the engine and re-couple.
+          wr8(hdaBase, capSd, rd8(hdaBase, capSd) & ~(UInt8)SD_CTL_RUN);
+          wr8(hdaBase, capSd + SD_REG_STS, 0x1C);
+          if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
+                          rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
+          // Same contract as the not-ready refusal above: the plugin
+          // swallows this return, so a timed-out start is a demand too.
+          gWasCapturing = true;
           return kIOReturnTimeout;
       }
       trigErr = rd32(ob, 8);             // LATITUDE FORK: sof_ipc_reply.error
@@ -2125,6 +2210,12 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
 }
 
 IOReturn LatSOFAudioDevice::stopCaptureGated() {
+    // patch-26: an explicit stop is an unambiguous statement of intent, even
+    // while hwReady is false. Clearing the wake latch here closes the case
+    // where the recording app quits during the retry window: its StopCapture
+    // no-ops on isCapturing below, but without this line the stale latch
+    // would later re-arm DMA for a session nobody holds.
+    gWasCapturing = false;
     if (!isCapturing) return kIOReturnSuccess;
 
     // Stop DMA
@@ -2176,7 +2267,7 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
 UInt32 LatSOFAudioDevice::getCapturePosition() {
     if (!hwReady) return 0;
     UInt32 dpib = rd32(hdaBase, HDA_VS_SDXDPIB_XBASE + HDA_VS_SDXDPIB_XINTERVAL * (UInt32)capIdx);
-    return dpib / kLatSOF_CapBytesPerFrame;  // 16 bytes/frame (4ch S32)
+    return dpib / kLatSOF_CapBytesPerFrame;  // 8 bytes/frame (2ch S32)
 }
 
 // ==================== Public wrappers (serialize via commandGate) ====================

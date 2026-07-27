@@ -147,8 +147,12 @@ notifications nobody acked, holding the shared `00:1f.3` interrupt line
 asserted until macOS throttled it — and that line is how AppleHDA receives
 *its* interrupts.
 
-Fixed in patch 11: never set `ADSPIC` bit 0 at all, and drain and acknowledge
-`TDR` at capture start, after trigger, at stop entry, and after `PCM_FREE`.
+Fixed in patch 11: keep `ADSPIC` bit 0 masked in steady state, and drain and
+acknowledge `TDR` at capture start, after trigger, at stop entry, and after
+`PCM_FREE`. (One caveat found much later: the firmware loader must unmask
+that bit for the ROM handshake, so the real rule is that `initDSP()` masks it
+again on every exit path — a post-fix audit found the failure paths didn't,
+and closed them; see patches 25–26 in `history/README.md`.)
 
 **Lesson (first time):** on a shared PCI function, an interrupt you enable and
 don't service breaks the *other* driver. Note that this lesson had to be
@@ -402,7 +406,7 @@ idempotent and call it from every exit path — including the ones that fail.
 
 ## If you are porting this
 
-Read `PORTING.md` for the procedure. From this log, the four things most likely
+Read `PORTING.md` for the procedure. From this log, the five things most likely
 to cost you a day:
 
 1. Verify under Linux first. Do not write kernel code to answer a hardware
