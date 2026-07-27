@@ -69,9 +69,16 @@ from it.
   interrupt line shared with AppleHDA. If firmware→host notifications
   (HIPCTDR) are left unacknowledged, the line stays asserted until macOS
   throttles it — which kills AppleHDA's playback interrupts and mutes the
-  speakers until reboot. This driver never unmasks `ADSPIC` bit 0, and it
-  drains/acks TDR at capture start, after trigger, and at stop. All IPC
-  waits are bounded polls (≤500 ms).
+  speakers until reboot. In steady state this driver keeps `ADSPIC` bit 0
+  masked, with exactly one exception: the DSP ROM requires the doorbell
+  interrupt enabled during the firmware-load handshake, so `initDSP()`
+  unmasks it for that window and masks it again before exiting — the mask
+  lives at the `cleanup:` label, and every path that can have unmasked it
+  passes through there (the handful of exits that bypass `cleanup:` all
+  occur before the unmask; do not arm the interrupt any earlier in the
+  function without re-checking that). Separately, the driver drains/acks
+  TDR at capture start, after trigger, and at stop. All IPC waits are
+  bounded polls (≤500 ms).
 
 ## DSP bring-up and pipeline
 
@@ -132,24 +139,25 @@ Filter state is cleared at capture start; denormals are flushed (a
 geometric decay into denormal range would cost real CPU inside a realtime
 callback).
 
-**Latency** is reported as 0, and honestly so: measuring it properly is harder
-than it looks. The obvious approach — play a burst, record it, subtract the
+**Latency** is reported as 0 — a known-wrong placeholder, kept because
+measuring the true value properly is harder than it looks. The obvious approach — play a burst, record it, subtract the
 output device's reported latency — fails, because the arrival timestamps come
 from this plugin's own clock model. That measures the suspect clock with the
 suspect clock, and duly returns physically impossible negative values. A valid
 measurement needs a second input device you trust (any USB microphone):
 capture the same burst on both in one run, and the difference in arrival times
 is this device's excess latency, with our timestamps out of the loop. Until
-then the architecturally defensible value is safety offset + buffer size.
+someone runs that, the architecturally defensible interim would be safety
+offset + buffer size — not yet adopted; the plugin still reports 0.
 
-**Clocking** is the other honest weak point: `GetZeroTimeStamp` is disciplined
-against the hardware DMA position (counted ring wraps, back-dated to the wrap
-instant, with a 1/8 correction filter), which is the right design — but note
-that this was *not* the fix for the playback failure above, and chasing it
-first cost real time. The DPIB hardware position is available and disciplining
-the timestamp stream against it is the intended next step; until then,
-very long recordings risk a periodic glitch when the drifted read point
-crosses the DMA write point.
+**Clocking**: `GetZeroTimeStamp` is disciplined against the hardware DMA
+position — the DPIB value read through the kext, with counted ring wraps,
+back-dated to the wrap instant, smoothed by a 1/8 correction filter. That is
+the right design, and it is what ships. Worth remembering that it was *not*
+the fix for the playback failure described under "The interrupt-starvation
+bug" below: it was written chasing a clock-drift theory a profiler disproved
+in one command, and kept because it is correct regardless (patch 13 in
+`history/README.md`).
 
 The plugin's Makefile encodes an install ritual (permission
 normalisation, quarantine stripping, `ditto`, sign-installed-copy-last,
