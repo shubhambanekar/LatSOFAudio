@@ -140,13 +140,39 @@ symptom list in §4.
 6. Echo cancellation misbehaving in calls → check what you report for
    `kAudioDevicePropertyLatency`. Do not measure it using your own device's
    timestamps; see `ARCHITECTURE.md`.
+7. **Cold boot works perfectly; audio breaks only after sleep** — and which
+   half breaks (mic, speakers, both) varies between wakes. This is the
+   hardest symptom on this list to attribute, and it cost a full day here:
+   it is the borrowed loader descriptor being written *after* the
+   hand-back. At boot that descriptor is empty and AppleHDA programs it
+   after you, so every violation is free; after a wake it is fully live,
+   and anything you write destroys a running playback engine. Diff
+   `SD-Borrow` against `SD-Final` in ioreg — if they differ, the differing
+   field names the write. If they match and audio still broke, distrust
+   any success telemetry emitted before the function's *last* write to the
+   descriptor; ours lied for a week that way. Treat mic-death and
+   speaker-death as two bugs, not one. Full story: Phase 13 in
+   `DEBUGGING-LOG.md`; the rule that ends it: "The borrowed-stream
+   contract" in `ARCHITECTURE.md`.
 
 ## 5. Rules that keep the machine bootable
 
 - Never start capture DMA at boot. Only from userspace, machine idle.
 - Never touch `GCTL` or any global controller state.
-- Never write `PPCTL` bit 0 or anything belonging to AppleHDA's
-  descriptors.
+- Never write `PPCTL` bit 0, and never touch AppleHDA's descriptors in
+  steady state. There is exactly **one** sanctioned exception, and your port
+  cannot avoid it: the DSP's code loader must run over an output stream
+  descriptor, and the ROM binds its code-load gateway by *stream tag* — on
+  this hardware that meant borrowing AppleHDA's first output engine,
+  `SD(numISS)`, for the duration of every firmware load. If you borrow, you
+  are bound by the borrowed-stream contract: snapshot the descriptor (and
+  SPIB/PPCTL) once, restore through one idempotent function called from
+  **every** exit path including the timeouts, and never write the
+  descriptor again after the hand-back. Publish before/after telemetry
+  read *after* your last write (`SD-Borrow`/`SD-Final` here) and require
+  them identical. Read "The borrowed-stream contract" in `ARCHITECTURE.md`
+  before writing a single line of loader code — violating it produces
+  symptom 7 in §4, the one that only appears after sleep.
 - Keep every wait bounded. An unbounded poll in an IOKit workloop is a
   hang, not a bug report.
 - Keep an EFI recovery path you have actually tested.
