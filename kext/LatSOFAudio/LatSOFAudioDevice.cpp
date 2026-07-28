@@ -303,6 +303,14 @@ static int  gWakeTickDivider = 0;
 // whether capture was live at sleep and reissue it once wake re-init succeeds.
 static bool gWasCapturing = false;
 
+// patch-27b: recovery episode budget. Review of patch-27 found an unbounded
+// livelock: a firmware that boots but has a dead runtime mailbox made
+// initDSP "succeed", the re-arm then timed out, and scheduleDspRecovery
+// reset the 12-try budget — forever, blocking the workloop ~8.5 s of every
+// ~10. Recovery now gets at most 3 episodes; the budget refills on a
+// successful capture start or on a genuine sleep/wake.
+static int gRecoveryEpisodes = 0;
+
 static bool poll32(volatile UInt8 *b, UInt32 o, UInt32 mask, UInt32 val, UInt32 usec) {
     for (UInt32 t = 0; t < usec; t += 500) {
         if ((rd32(b, o) & mask) == val) return true;
@@ -1312,6 +1320,19 @@ bool LatSOFAudioDevice::initDSP() {
                   setProperty("PM", pmstr);
                 }
 
+                // LATITUDE FORK patch-27b: a firmware that reaches FW_READY
+                // but acknowledges ZERO pipeline IPCs has a dead runtime
+                // mailbox — capture can never work on it. Declaring success
+                // here fed an unbounded recovery loop: the rebuild "passed",
+                // the re-arm timed out, and the retry budget reset forever.
+                // Fail the init instead; hwReady stays false, the retry
+                // engine's 12-try budget counts, and give-up stays reachable.
+                if (ipcOk == 0) {
+                    setProperty("Status", "FAILED: runtime IPC dead"),
+                        IOLog("LatSOF: %s\n", "FAILED: runtime IPC dead");
+                    goto cleanup;
+                }
+
                 // Save hardware state
                 hdaBase = hda; dspBase = dsp;
                 this->ppCap = ppCap; this->spibCap = spibCap; this->mlCap = mlCap;
@@ -1573,6 +1594,14 @@ void LatSOFAudioDevice::shutdownDSPGated() {
 // else in this file.
 void LatSOFAudioDevice::scheduleDspRecovery(const char *reason) {
     if (!pciDevice || !hdaBase || !dspBase) return;   // teardown — nothing to recover
+    // patch-27b: bounded episodes. Without this cap, a rebuild that
+    // "succeeds" against a dead mailbox followed by a failed re-arm would
+    // re-enter here and reset the retry budget indefinitely.
+    if (++gRecoveryEpisodes > 3) {
+        setProperty("DSP-Recovery", "exhausted (3 episodes) — sleep/wake to retry");
+        IOLog("LatSOF: DSP recovery exhausted; deferring to next sleep/wake\n");
+        return;
+    }
     hwReady = false;
     gWakeReinitPending = true;
     gWakeTries = 0;
@@ -1653,6 +1682,7 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
             gWakeReinitPending = true;
             gWakeTries = 0;
             gWakeTickDivider = 0;
+            gRecoveryEpisodes = 0;   // patch-27b: each wake grants a fresh budget
             setProperty("Wake-Retry", "scheduled");
         }
     }
@@ -2243,6 +2273,7 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       setProperty("Capture-Debug", dbg); }
 
     isCapturing = true;
+    gRecoveryEpisodes = 0;   // patch-27b: a working capture refills the budget
     return kIOReturnSuccess;
 }
 
