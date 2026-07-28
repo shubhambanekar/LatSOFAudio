@@ -177,19 +177,30 @@ handles code-signing, permissions and verification, and refuses to restart
   Microphone**.
 - "Hey Siri" and Apple Intelligence are hardware-gated by Apple (T2 /
   Apple silicon) and are not fixable by any driver.
-- **Siri by voice does not work** (the sphere opens, hears nothing, closes) —
-  and this is not fixable from userspace, by this driver or otherwise.
-  `corespeechd` selects its record device by hunting for the built-in
-  microphone itself, and it picks AppleHDA's **dead** "Built-in Microphone"
-  (present because the codec layout defines input paths for a codec with no
-  mic wired to it). It ignores the default-input setting, stores no
-  preference that could be edited, refuses to be hidden, and if the dead
-  device is made unopenable (hog mode) Siri fails before its UI even
-  appears — there is no fallback. Dictation, QuickTime and FaceTime all
-  work because they honor the default input (Dictation even stores this
-  device's UID explicitly). **Type to Siri works.** The only real fix is an
-  AppleALC layout with no input paths, so the dead devices are never
-  published — untested here so far.
+- **Siri by voice: check your DNS before blaming audio.** On this machine
+  the sphere opened, heard nothing and closed on every attempt — and the
+  terminal cause turned out to be a poisoned resolver cache entry sending
+  `guzzoni.apple.com` (Siri's voice-recognition endpoint) to `0.0.0.0`, so
+  the audio stream was refused server-side no matter which microphone
+  captured it. `sudo dscacheutil -flushcache && sudo killall -HUP
+  mDNSResponder` fixed it; voice Siri then worked immediately. Diagnose
+  with `dscacheutil -q host -a name guzzoni.apple.com` — if you see
+  `0.0.0.0`, that's your problem, not the driver.
+- **Siri's device selection never picks this driver's mic.** A real,
+  separate issue uncovered along the way: `corespeechd` hunts for a record
+  device itself, ignoring the default-input setting, and prefers — in
+  observed order — USB inputs, then AppleHDA's **dead** "Built-in
+  Microphone" (present because the codec layout defines input paths for a
+  codec with no mic wired to it), and never this driver's device. It stores
+  no editable preference, refuses to be hidden, and does not fall back if
+  its pick is made unopenable. In practice: **voice Siri works with any USB
+  microphone attached** (Siri routes to it); on the bare laptop it records
+  the dead device and hears silence. Dictation, QuickTime and FaceTime all
+  honor the default input and work with the internal mics (Dictation stores
+  this device's UID explicitly). **Type to Siri always works.** A possible
+  bare-laptop fix is an AppleALC layout with no input paths so the dead
+  devices are never published — untested, and it gambles on `corespeechd`
+  accepting a userspace HAL device when nothing else exists.
 
 ## FAQ
 
