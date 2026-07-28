@@ -177,6 +177,19 @@ handles code-signing, permissions and verification, and refuses to restart
   Microphone**.
 - "Hey Siri" and Apple Intelligence are hardware-gated by Apple (T2 /
   Apple silicon) and are not fixable by any driver.
+- **Siri by voice does not work** (the sphere opens, hears nothing, closes) —
+  and this is not fixable from userspace, by this driver or otherwise.
+  `corespeechd` selects its record device by hunting for the built-in
+  microphone itself, and it picks AppleHDA's **dead** "Built-in Microphone"
+  (present because the codec layout defines input paths for a codec with no
+  mic wired to it). It ignores the default-input setting, stores no
+  preference that could be edited, refuses to be hidden, and if the dead
+  device is made unopenable (hog mode) Siri fails before its UI even
+  appears — there is no fallback. Dictation, QuickTime and FaceTime all
+  work because they honor the default input (Dictation even stores this
+  device's UID explicitly). **Type to Siri works.** The only real fix is an
+  AppleALC layout with no input paths, so the dead devices are never
+  published — untested here so far.
 
 ## FAQ
 
