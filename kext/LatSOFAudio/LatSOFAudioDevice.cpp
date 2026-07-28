@@ -1549,6 +1549,38 @@ void LatSOFAudioDevice::shutdownDSPGated() {
     hwReady = false;
 }
 
+// LATITUDE FORK patch-27: self-healing after a capture IPC timeout.
+//
+// Field failure, observed twice (27-28 Jul): a WebRTC client's session
+// setup/teardown (Meet in Chrome/Brave — they open, close and reopen the
+// device rapidly while joining) leaves the SOF firmware's PCM state
+// desynced. From then on every capture PCM_PARAMS or TRIG_START times out:
+// the mic is dead until the DSP is rebuilt, and the plugin cannot retry
+// (it only issues StartCapture on its 0->1 client transition). Previously
+// the only cures were a sleep/wake or a reboot.
+//
+// The cure already exists in this driver and survived four audit rounds:
+// the wake-retry engine plus the capture demand latch. So on an IPC
+// timeout we declare the DSP dead exactly as a wake does — hwReady false,
+// retry round scheduled — and jackPoll rebuilds the firmware within
+// ~1.5 s (deferring while AppleHDA's output is busy, as always). If the
+// timeout was in a *start*, the demand latch is already set and the
+// rebuild re-arms capture automatically; a mid-recovery StartCapture is
+// refused with the demand latched, exactly like the wake window.
+//
+// Runs gated (capture paths and jackPoll share the workloop), so touching
+// the retry statics here is race-free by the same argument as everywhere
+// else in this file.
+void LatSOFAudioDevice::scheduleDspRecovery(const char *reason) {
+    if (!pciDevice || !hdaBase || !dspBase) return;   // teardown — nothing to recover
+    hwReady = false;
+    gWakeReinitPending = true;
+    gWakeTries = 0;
+    gWakeTickDivider = 0;
+    setProperty("DSP-Recovery", reason);
+    IOLog("LatSOF: DSP recovery scheduled: %s\n", reason);
+}
+
 // Fast, MMIO-poll-free sleep teardown. See header for rationale.
 void LatSOFAudioDevice::shutdownForSleepGated() {
     // fastMute already guards sharedDmaBuf/i2cBase, safe if not alloc'd.
@@ -2142,6 +2174,9 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
           // Same contract as the not-ready refusal above: the plugin
           // swallows this return, so a timed-out start is a demand too.
           gWasCapturing = true;
+          // patch-27: a timed-out PCM_PARAMS means the firmware's PCM
+          // state is desynced; nothing short of a rebuild recovers it.
+          scheduleDspRecovery("capture PCM_PARAMS timeout");
           return kIOReturnTimeout;
       }
       paramsErr = rd32(ob, 8);           // LATITUDE FORK: sof_ipc_reply.error
@@ -2185,6 +2220,8 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
           // Same contract as the not-ready refusal above: the plugin
           // swallows this return, so a timed-out start is a demand too.
           gWasCapturing = true;
+          // patch-27: same rationale as the PCM_PARAMS site above.
+          scheduleDspRecovery("capture TRIG_START timeout");
           return kIOReturnTimeout;
       }
       trigErr = rd32(ob, 8);             // LATITUDE FORK: sof_ipc_reply.error
@@ -2227,6 +2264,13 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
     wr32(hdaBase, HDA_INTCTL, rd32(hdaBase, HDA_INTCTL) & ~(1U << capIdx));
 
     // TRIG_STOP + PCM_FREE
+    // patch-27: results are no longer ignored. A stop whose IPCs time out
+    // leaves the firmware's PCM open — the exact state that made the NEXT
+    // start's PCM_PARAMS time out in the field (the "sent twice" firmware
+    // behavior the audits flagged as a residual). If either times out,
+    // schedule the DSP rebuild now, while nobody wants the mic, instead of
+    // leaving the wreck for the next start to trip over.
+    bool stopIpcOk = true;
     auto sendCapIpc = [&](UInt32 cmd) {
         wr32(dspBase, IPC_HIPCIDA, rd32(dspBase, IPC_HIPCIDA) | IPC_DONE);
         wr32(dspBase, IPC_HIPCCTL, rd32(dspBase, IPC_HIPCCTL) | 0x02);
@@ -2235,12 +2279,14 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
         volatile UInt8 *ob = dspBase + outboxOff;
         for (UInt32 i = 0; i < 12; i += 4) wr32(ob, i, *(UInt32*)((UInt8*)&m + i));
         wr32(dspBase, IPC_HIPCIDR, IPC_BUSY);
-        poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000);
+        if (!poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000))
+            stopIpcOk = false;
         wr32(dspBase, IPC_HIPCIDA, rd32(dspBase, IPC_HIPCIDA) | IPC_DONE);
         wr32(dspBase, IPC_HIPCCTL, rd32(dspBase, IPC_HIPCCTL) | 0x02);
     };
     sendCapIpc(0x60050000); // TRIG_STOP
     sendCapIpc(0x60030000); // PCM_FREE
+    if (!stopIpcOk) scheduleDspRecovery("capture stop IPC timeout");
 
     // LATITUDE FORK: post-run snapshot BEFORE the ring is cleared —
     // proves whether audio landed independently of any position register.

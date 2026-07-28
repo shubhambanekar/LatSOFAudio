@@ -139,6 +139,14 @@ private:
     // ring buffer can't loop audibly, and resumes it on open.
     void     handleClamshellChangeGated(bool closed);
 
+    // patch-27: declare the DSP dead and hand recovery to the wake-retry
+    // engine. Called from the gated capture paths when an IPC times out —
+    // the observed field failure is WebRTC clients (Brave/Meet join dances)
+    // desyncing the firmware's PCM state so every later start times out
+    // until the DSP is rebuilt. Reuses the audited retry machinery:
+    // jackPoll rebuilds within ~1.5 s and the demand latch re-arms capture.
+    void     scheduleDspRecovery(const char *reason);
+
     // Fast mute: codec mute (RT5682) + DMA buffer bzero. Called on the
     // kIOMessageSystemWillSleep early notification and at shutdownDSP entry,
     // so the PM sleep window cannot produce "last-frame looping" audio.
