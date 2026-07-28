@@ -197,10 +197,30 @@ handles code-signing, permissions and verification, and refuses to restart
   microphone attached** (Siri routes to it); on the bare laptop it records
   the dead device and hears silence. Dictation, QuickTime and FaceTime all
   honor the default input and work with the internal mics (Dictation stores
-  this device's UID explicitly). **Type to Siri always works.** A possible
-  bare-laptop fix is an AppleALC layout with no input paths so the dead
-  devices are never published — untested, and it gambles on `corespeechd`
-  accepting a userspace HAL device when nothing else exists.
+  this device's UID explicitly). **Type to Siri always works.**
+
+  **The gamble was run and the answer is definitive (28 Jul, custom
+  output-only AppleALC layout — next bullet): even as the ONLY input
+  device in the system, this driver's mic is invisible to Siri.** The
+  sphere reports "Siri Not Available — Connect a microphone" while the
+  audio-session layer touches the device by UID in the same log window;
+  `corespeechd`'s selection returns `deviceId = (null)`. Conclusion:
+  Siri's selector admits only kernel-published audio devices
+  (`IOAudioFamily` — AppleHDA, USB audio) and excludes userspace
+  AudioServerPlugIn devices by class; no layout, preference or property
+  changes that from user space. The one real path to bare-laptop voice
+  Siri is publishing the capture stream as a kernel `IOAudioEngine` from
+  the kext — the API family USB mics use, which demonstrably passes the
+  filter. A substantial, defined future project; not a configuration fix.
+
+- **An output-only codec layout works on Sequoia** — a side result
+  believed to be a first: an AppleALC layout for the ALC236 with **zero
+  input paths** (id 90 in this project's fork) boots and runs — the
+  analog output engine publishes, speakers/headphones and jack switching
+  work, and the phantom input devices are gone from every app's device
+  picker. Sequoia's AppleHDA does not require an ADC path in an analog
+  PathMap. Useful for any dead-codec DMIC board wanting an honest device
+  list; a candidate for upstreaming to AppleALC.
 
 ## FAQ
 
