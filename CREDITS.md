@@ -80,9 +80,9 @@ For honesty's sake, the contributions specific to this project are:
   `ARCHITECTURE.md`; the week it ended is Phase 13 of `DEBUGGING-LOG.md`.
 - Board-specific configuration for the Dell Latitude 3410 derived from its own
   NHLT data, and an input-only HAL plugin with software gain and DC blocking.
-- The install procedure in `INSTALL.md`, including the `-67030` diagnosis,
-  which is a file-permission fault that masquerades as a code-signing policy
-  rejection.
+- The plugin install ritual (now in the plugin's Makefile, with the story in
+  `DEBUGGING-LOG.md` Phase 8), including the `-67030` diagnosis — a
+  file-permission fault that masquerades as a code-signing policy rejection.
 
 ## Licence
 

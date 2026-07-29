@@ -72,8 +72,10 @@ Everything board-specific sits in a small cluster of constants:
 
 - **DAI config from your NHLT**, not this repo's: `num_pdm_active`, which
   PDM controllers carry mics, sample rate, container width. A 4-mic board
-  will need the 4-channel stream format (`0x0043`) and a different
-  channel map in the HAL plugin's `ReadInput`.
+  will need the 4-channel stream format (`0x0043`) and a matching change to
+  `kEngineChannels` plus the channel handling in
+  `LatSOFKernelAudioEngine::convertInputSamples`
+  (`kext/LatSOFAudio/LatSOFKernelAudio.cpp`).
 - **Stream format**: `0x0041` = 48 kHz / 2 ch / 32-bit container. Derive
   yours from the HDA SDxFMT encoding if your NHLT differs.
 - **PDM clock range**: this port narrows `pdmclk_min` to 2.4 MHz (from
@@ -96,7 +98,7 @@ named.
 | Stream engine + tag | `capIdx` / `capTag` in `LatSOFAudioDevice.cpp` | which HDA input DMA engine and stream tag this driver uses — must not collide with AppleHDA | AppleHDA on single-codec laptops keeps SD0, so SD1 / tag 2 is a safe default | SD1, tag 2 |
 | Loader stream + tag | `sIdx` / `sTag` in `initDSP()` | which **output** engine carries firmware loads. `SD(numISS)` is AppleHDA's first output engine, and the ROM binds the code-load gateway by *tag* — this is a **borrow**, not a free descriptor, governed by the contract in §5 | derived from `GCAP` (`sIdx = numISS`); do not relocate without moving the tag too | SD7, tag 1 |
 | DMIC topology payloads | `kext/LatSOFAudio/tplg_ipc_data.h` | the captured IPC topology stream — recorded by the parent project from a working Linux session on the donor C1030 — with the DMIC/DAI messages adapted to this board's NHLT | adapt the DMIC/DAI messages to **your** NHLT (`sudo cat /sys/firmware/acpi/tables/NHLT > nhlt.bin` under Linux), or capture your own stream the same kprobe way — either path is the substantive porting work, see §3 | this board's NHLT |
-| Device names / UIDs | `kDevice_Name`, `kDevice_UID` and neighbours in `plugin/LatSOFAudioPlugin.c` | what Sound settings displays | cosmetic — change freely | "LatSOF Internal Microphone", "Dell Latitude 3410" |
+| Device names | `setDeviceName` / `setDeviceShortName` / `setManufacturerName` / `setDeviceModelName` calls in `LatSOFKernelAudioDevice::initHardware`, and `setDescription` in `LatSOFKernelAudioEngine::initHardware` (`kext/LatSOFAudio/LatSOFKernelAudio.cpp`) | the `initHardware` calls set the device identity seen in `ioreg` (IOAudioDeviceName) and the manufacturer/model strings; **the name Sound settings displays is the engine's `setDescription`** ("LatSOF DMIC capture") | cosmetic — change freely. Do **not** touch the transport type or the `'imic'` input selector next to them: those are what make Siri accept the device | ioreg: "LatSOF Internal Microphone"; Sound settings: "LatSOF DMIC capture" |
 | Controller identity | located by registry walk on the HDA controller at `00:1f.3` | where BAR4 and the DSP live | your §0 `lspci` check — must be `8086:02c8` | `8086:02c8` |
 
 Everything not in this table is design, not configuration — if you find
@@ -178,12 +180,23 @@ symptom list in §4.
   hang, not a bug report.
 - Keep an EFI recovery path you have actually tested.
 
-## 6. HAL plugin
+## 6. Kernel audio engine
 
-Usually needs only cosmetics: device/manufacturer names, UIDs, and — if
-your channel count differs — the `ReadInput` conversion loop and stream
-format descriptions. The gain constant (32×) suits this board's DMIC
+The device macOS sees is published by the kext itself
+(`kext/LatSOFAudio/LatSOFKernelAudio.cpp` — the old userspace HAL plugin
+under `plugin/` is retired; don't install both). A port usually needs only
+cosmetics here: the names in `LatSOFKernelAudioDevice::initHardware`, and —
+if your channel count differs — `kEngineChannels` and the conversion loop
+in `convertInputSamples`. The default gain (+30 dB) suits this board's DMIC
 sensitivity; check your own raw levels before copying it.
+
+Three things in this file are load-bearing, not cosmetic. The built-in
+transport type plus the `'imic'` input selector are what make Siri accept
+the device (see the Siri section in the README). The back-dated timestamps
+in `stampBackdated` are what keep the CoreAudio clock honest. And the
+install path is `/Library/Extensions` + `sudo kmutil load -p`, **not** your
+EFI — the kext links `IOAudioFamily`, which OpenCore cannot resolve, and an
+EFI entry fails silently (INSTALL.md §6).
 
 If you port successfully, please open an issue with your board name, your
 NHLT-derived DAI values, and which descriptor/tag you used — that is

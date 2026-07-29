@@ -1,29 +1,77 @@
 # Installing LatSOFAudio
 
-A complete walkthrough, assuming nothing beyond a working OpenCore
-hackintosh. Every step shows the command to run and what its output should
-look like. Tested on a Dell Latitude 3410 under macOS Sequoia 15.x.
+A complete walkthrough that assumes nothing except a hackintosh that already
+boots macOS with OpenCore. Every step shows the command and what its output
+should look like. Tested on a Dell Latitude 3410 under macOS Sequoia 15.7.7.
 
-Time: about 15 minutes, plus one reboot.
+**Time:** about 20 minutes and two reboots.
+
+**What you get when you finish:** a working internal microphone — Dictation,
+QuickTime, FaceTime, Zoom/Teams/Meet, and **Siri**, on the laptop's own mics
+with nothing plugged in.
+
+> **Read this before you start.** As of July 2026 this kext installs to
+> `/Library/Extensions`, **not** into your EFI. If you followed an older
+> version of these instructions and put `LatSOFAudio.kext` in `EFI/OC/Kexts`,
+> it silently never loaded. Section 6 explains why. If you are upgrading from
+> the old HAL-plugin version, do section 9 (uninstall) first.
+
+## Contents
+
+0. [What you need](#0-what-you-need)
+1. [Get the source](#1-get-the-source)
+2. [Get the firmware](#2-get-the-firmware--required)
+3. [Build the kext](#3-build-the-kext)
+4. [Install it](#4-install-the-kext)
+5. [Reboot and verify](#5-reboot-and-verify)
+6. [Why not the EFI?](#6-why-not-the-efi)
+7. [Fix headphone crackle](#7-fix-headphone-crackle-optional-but-recommended)
+8. [Turn on Siri](#8-siri)
+9. [Uninstalling / rolling back](#9-uninstalling)
+10. [Troubleshooting](#10-troubleshooting)
 
 ## 0. What you need
 
-- A Comet Lake laptop whose DMICs work under Linux with the `sof-cml`
-  firmware — verify this first, see [`PORTING.md`](PORTING.md). If Linux
-  can't record, macOS won't either, and you'll save yourself days.
-- A working OpenCore install. If your EFI already loads Lilu and
-  VirtualSMC — it does, or you wouldn't be booted — it will load this kext
-  the same way. Nothing extra is needed.
-- Command Line Tools:
+- **The right hardware.** A Comet Lake laptop whose internal mics work under
+  Linux with the `sof-cml` firmware. Verify this first with a Linux live USB —
+  see [`PORTING.md`](PORTING.md) §0. It takes five minutes and saves days.
+- **A working OpenCore install.** If your EFI already loads Lilu and
+  VirtualSMC, you have everything you need.
+- **SIP partially disabled** so macOS will load an unsigned kext. Check:
+
+  ```sh
+  nvram -p | grep csr-active-config
+  ```
+
+  On a typical hackintosh the output looks exactly like this (there is a tab
+  between the name and the value):
+
+  ```
+  csr-active-config	%03%08%00%00
+  ```
+
+  Each `%XX` is one byte, lowest byte first — so `%03%08%00%00` is the value
+  `0x803`, which allows unsigned kexts and is fine. Any value whose **first**
+  byte is odd (`%01`, `%03`, `%67`, …) works, because that's the
+  allow-unsigned-kexts bit.
+
+  If the command prints nothing, or the first byte is even (e.g.
+  `%00%00%00%00`), set `csr-active-config` to `03080000` in your
+  `config.plist` under `NVRAM → Add → 7C436110-AB2A-4BBB-A880-FE41995C9F82`.
+  Two traps: it is a **Data** entry, not a String — in ProperTree paste
+  `03080000` as hex — and OpenCore only applies the `Add` value if the
+  variable isn't already set, so also list `csr-active-config` under
+  `NVRAM → Delete` for the same GUID (or reset NVRAM from the OpenCore boot
+  menu). Reboot and re-run the check before continuing.
+- **Command Line Tools:**
 
   ```sh
   xcode-select --install
   ```
 
-- A way to recover if an EFI edit goes wrong: another OS that can mount
-  the EFI partition, or a USB stick with a known-good EFI. You will
-  probably never need it. Have it anyway.
-- Back up your EFI partition before you start.
+- **A recovery path.** Another OS that can mount the EFI partition, or a USB
+  stick with a known-good EFI. You probably won't need it. Have it anyway.
+- **Back up your EFI partition before you start.**
 
 ## 1. Get the source
 
@@ -32,23 +80,25 @@ git clone https://github.com/shubhambanekar/LatSOFAudio.git
 cd LatSOFAudio
 ```
 
-## 2. Get the firmware — required, the build fails without it
+## 2. Get the firmware — required
 
-`sof-cml.ri` is not distributed in this repo. In order of preference:
+`sof-cml.ri` is **not** distributed in this repo, and the build fails without
+it. In order of preference:
 
-1. **From the Linux install you verified with** — this is the best source,
-   because it's the exact binary you already proved works on your board:
-   `/lib/firmware/intel/sof/sof-cml.ri` (if it's a symlink, copy the file
-   it points to). Copy it out via a USB stick.
-2. From a **[sof-bin](https://github.com/thesofproject/sof-bin/releases)**
-   release in the **v2.2.x** series — inside the archive the file is at
-   `sof-v2.2.x/sof-cml.ri`.
-3. From the `linux-firmware` repository: `intel/sof/sof-cml.ri`.
+1. **From the Linux install you verified with** — the exact binary you already
+   proved works on your board: `/lib/firmware/intel/sof/sof-cml.ri`. If it's a
+   symlink, copy the file it points to. **Copy it while you're still booted in
+   Linux** — onto the live USB itself, a second FAT-formatted stick, or the
+   EFI partition — because macOS cannot read the Linux filesystem afterwards.
+   Some distros ship the file compressed as `sof-cml.ri.zst` or `.ri.xz`;
+   decompress first (`zstd -d sof-cml.ri.zst` or `unxz sof-cml.ri.xz`) — the
+   kext needs the raw `.ri`.
+2. From a [sof-bin](https://github.com/thesofproject/sof-bin/releases) release
+   in the **v2.2.x** series: `sof-v2.2.x/sof-cml.ri`.
+3. From `linux-firmware`: `intel/sof/sof-cml.ri`.
 
 Use the **IPC3 generation (the v2.2.x line)**. Newer IPC4 firmware speaks a
-different protocol and will not work with this driver.
-
-Place it at exactly this path inside the repo, then sanity-check the size:
+different protocol and will not work.
 
 ```sh
 cp /path/to/sof-cml.ri kext/LatSOFAudio/Firmware/
@@ -70,171 +120,370 @@ The last line should be:
 === Build complete: LatSOFAudio.kext ===
 ```
 
-If instead you see `No rule to make target ... sof-cml.ri`, the firmware
-isn't at the path from step 2.
+If you see `No rule to make target ... sof-cml.ri`, the firmware isn't at the
+path from step 2.
 
-Building on the target machine with Command Line Tools is the tested path;
-the Makefile can also cross-compile from an Apple silicon Mac.
+## 4. Install the kext
 
-## 4. Copy the kext into your EFI
+This copies the kext where macOS itself can load it, sets the ownership macOS
+requires, and asks the system to link it.
 
-Find and mount the EFI partition (type `EFI`, usually ~200 MB, usually
-`disk0s1`):
-
-```sh
-diskutil list
-sudo diskutil mount disk0s1
-```
-
-Note the volume name the mount prints — commonly `EFI` or `NO NAME` — and
-use it below:
+Run this from the `kext/` directory where `make` left `LatSOFAudio.kext` — if
+you opened a new terminal since step 3, `cd` back first (e.g.
+`cd ~/LatSOFAudio/kext`):
 
 ```sh
-sudo ditto LatSOFAudio.kext "/Volumes/<your ESP>/EFI/OC/Kexts/LatSOFAudio.kext"
+sudo ditto LatSOFAudio.kext /Library/Extensions/LatSOFAudio.kext
+sudo chown -R root:wheel /Library/Extensions/LatSOFAudio.kext
+sudo chmod -R 755 /Library/Extensions/LatSOFAudio.kext
+sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
 ```
 
-## 5. Tell OpenCore about it
+**The expected result of the last command looks like an error and is not:**
 
-Open `EFI/OC/config.plist` in your usual editor
-([ProperTree](https://github.com/corpnewt/ProperTree) if you don't have
-one). Under **Kernel → Add**, add this entry anywhere **after Lilu** —
-last is fine:
-
-```xml
-<dict>
-	<key>Arch</key>
-	<string>Any</string>
-	<key>BundlePath</key>
-	<string>LatSOFAudio.kext</string>
-	<key>Comment</key>
-	<string>SOF DMIC capture</string>
-	<key>Enabled</key>
-	<true/>
-	<key>ExecutablePath</key>
-	<string>Contents/MacOS/LatSOFAudio</string>
-	<key>MaxKernel</key>
-	<string></string>
-	<key>MinKernel</key>
-	<string></string>
-	<key>PlistPath</key>
-	<string>Contents/Info.plist</string>
-</dict>
+```
+Error Domain=KMErrorDomain Code=28 "Loading extension(s):
+com.hackintosh.LatSOFAudio requires a reboot"
 ```
 
-What the fields mean: `BundlePath` is the folder name you copied into
-`Kexts`; `ExecutablePath` is the binary inside it; `PlistPath` is its
-`Info.plist`. All three must match exactly or the kext silently fails to
-load. If you manage your config with OCAuxiliaryTools, use its kext-sync
-instead and check the generated entry against the values above.
-
-Save, and reboot.
-
-## 6. Verify the kext loaded
+That message means macOS accepted the kext and staged it for the next boot.
+Confirm it landed:
 
 ```sh
-kmutil showloaded --list-only | grep -i sof
+kmutil inspect | grep -i latsof
 ```
 
-Expect a line containing:
+You should see `com.hackintosh.LatSOFAudio` listed with
+`/Library/Extensions/LatSOFAudio.kext`.
 
-```
-com.hackintosh.LatSOFAudio (1.1.5)
-```
+> **Do not use `kmutil install --update-all`.** That subcommand rebuilds the
+> Boot and System collections and demands a Kernel Debug Kit matching your
+> exact macOS build — on a hackintosh it fails with *"Missing Developer Kit"*.
+> `kmutil load -p` is the right command; it only touches the auxiliary
+> collection, which is where third-party kexts belong.
 
-If it's missing, see Troubleshooting below — it's almost always one of the
-three paths in step 5.
+If macOS shows a **"System Extension Blocked"** notification, open System
+Settings → Privacy & Security, scroll to the bottom, click **Allow**, and run
+the `kmutil load -p` command again.
 
-## 7. Build and install the CoreAudio plugin
+Now reboot.
+
+## 5. Reboot and verify
+
+Three checks, in order. Each one tells you something different.
+
+**Is the kext loaded?**
 
 ```sh
-cd plugin
-make install
+kmutil showloaded | grep -i latsof
 ```
 
-It will ask for your password (it installs into `/Library/Audio/Plug-Ins/HAL`
-and restarts the audio server). The output must include:
+Expect a line containing `com.hackintosh.LatSOFAudio (1.1.5)`.
 
-```
-=== build seal OK ===
-SEAL-OK
-device published
-```
-
-The Makefile handles permissions, extended attributes, code-signing, and
-verification, and refuses to restart `coreaudiod` unless the installed
-bundle verifies — the ordering matters, so use `make install` rather than
-copying by hand.
-
-## 8. Select the microphone and test
-
-System Settings → Sound → Input → **LatSOF Internal Microphone**.
-
-You will see two similar entries; the plain "Internal Microphone
-(Built-in)" is AppleHDA's dead codec path and records silence on this
-hardware — see "Which name is which" in the README. Pick the **LatSOF**
-one, watch the level meter move when you speak, and confirm with a short
-QuickTime audio recording.
-
-Done. Sleep/wake, Dictation, and FaceTime all work from here.
-
-## Troubleshooting
-
-**Build fails with `No rule to make target ... sof-cml.ri`** — the
-firmware is missing or misplaced. Step 2; the path must be exactly
-`kext/LatSOFAudio/Firmware/sof-cml.ri`.
-
-**Kext absent from `kmutil showloaded`** — in the config entry, check
-character-for-character: `BundlePath` = `LatSOFAudio.kext`,
-`ExecutablePath` = `Contents/MacOS/LatSOFAudio`, `PlistPath` =
-`Contents/Info.plist`; confirm the bundle really is inside `EFI/OC/Kexts`;
-OCAuxiliaryTools users, re-run kext sync. A mismatched path fails
-*silently* — no error anywhere.
-
-**Kext loaded but no device in Sound settings** — check the driver
-matched and the plugin installed:
+**Did the DSP come up and did it publish an audio device?**
 
 ```sh
-ioreg -rc LatSOFAudioDevice -d 1 -w0 | head -3
-cd plugin && make status
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "Status|SD-Borrow|SD-Final"
+ioreg -rc LatSOFKernelAudioDevice -w0 | grep IOAudioDeviceName
 ```
 
-`make status` should end with `SEAL-OK` and `device published`.
+You want `"Status" = "OK"`, the device name `LatSOF Internal Microphone`, and
+the borrow check to pass. The two SD lines look like this (stream number and
+register values vary by machine — these are the reference laptop's):
 
-**Plugin refuses to load with a code-signature error (Security -67030)** —
-this is a *file permissions* fault masquerading as a signing-policy
-rejection: the audio server's unprivileged user can't read a file inside
-the bundle (typically an `Info.plist` that came through a browser download
-with a restrictive mode). `make install` prevents it by construction; if
-you installed by hand, don't — run `make install`.
+```
+"SD-Borrow" = "sd7 ctl=0x040000 fmt=0x0000 bdl=0x00000000 ppctl=0x40000000"
+"SD-Final"  = "sd7 ctl=0x040000 fmt=0x0000 bdl=0x00000000 cbl=0 lvi=0 ppctl=0x40000000 spiben=0x00000000"
+```
 
-**Microphone permission prompts never appear / Privacy → Microphone list
-is empty** — you have `amfi=0x80` in your boot-args. Remove it; it breaks
-TCC prompts system-wide. If something else in your EFI needed AMFI relaxed
-(OCLP-patched Wi-Fi is the usual culprit), use AMFIPass instead of the
-boot-arg.
+They are **not** textually identical — `SD-Final` reports three extra fields
+(`cbl`, `lvi`, `spiben`). The check is **field-for-field**: every field that
+appears in *both* lines (`ctl`, `fmt`, `bdl`, `ppctl`) must show the same
+value in each. That's the proof AppleHDA's borrowed stream was handed back
+untouched — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Device present but recordings are silent** — you selected the wrong of
-the two microphone entries (step 8), or your firmware is not the IPC3
-`sof-cml` build (step 2), or your board isn't Comet Lake with
-SOF-attached DMICs (step 0 / `PORTING.md`).
+**Does macOS see a microphone?**
 
-**Headphones (3.5mm) have static/crackle** — almost certainly the classic
-ALC 44.1 kHz problem, and it has a trap in it: switching the output to
-48,000 Hz in Audio MIDI Setup is **not sufficient on its own**. The codec
-path is only fully reprogrammed when the engine is rebuilt, so after
-changing the rate you must **sleep and wake the machine** (or reboot) for
-the fix to actually take — testing the new rate live will falsely tell
-you the rate wasn't the problem. It was; that false negative cost this
-project an evening. To make the fix survive preference wipes and NVRAM
-resets, build `contrib/latsof-setrate.c` and run it as a login
-LaunchAgent pinned to `48000`:
+```sh
+system_profiler SPAudioDataType | grep -A8 "LatSOF DMIC"
+```
+
+Expect a block like:
+
+```
+LatSOF DMIC capture:
+
+  Default Input Device: Yes
+  Input Channels: 2
+  Manufacturer: Dell Latitude 3410
+  Current SampleRate: 48000
+  Transport: Built-in
+  Input Source: Internal Microphone
+```
+
+**Now test it:** System Settings → Sound → Input. **You may see two input
+devices** — pick **LatSOF DMIC capture**. The other one, plainly named
+"Internal Microphone", is AppleHDA's codec path and records only silence on
+this hardware; its presence is expected, not a fault. Speak and watch the
+level meter move, then try Dictation (press the dictation key or Edit → Start
+Dictation) and say a sentence.
+
+## 6. Why not the EFI?
+
+Older versions of this project injected the kext through OpenCore. **That no
+longer works, and the failure is silent** — no error in any log, the kext
+simply never appears.
+
+The reason: this kext depends on Apple's `IOAudioFamily`, which lives in the
+**System** kernel collection. OpenCore injects into the **Boot** collection and
+can only resolve dependencies found there. It hits an unresolvable dependency
+and drops the bundle without complaining. You can see the split yourself:
+
+```sh
+kmutil inspect | awk '/collection at/{c=$0} /IOAudioFamily/{print c; print "  " $0}'
+```
+
+Installing to `/Library/Extensions` hands the job to macOS's own linker
+(`kernelmanagerd`), which can see every collection. That's the supported path
+for third-party kexts that depend on system frameworks, and it's what the
+OpenCore maintainers recommend for exactly this situation.
+
+**If you previously added a `Kernel → Add` entry for `LatSOFAudio.kext`, set
+its `Enabled` to `false`** (or remove it). Leaving both in place risks two
+copies of the driver racing for the same hardware.
+
+## 7. Fix headphone crackle (optional but recommended)
+
+Unrelated to the microphone, but it bites nearly every ALC laptop and this is
+where people look for it.
+
+**Symptom:** static, crackling or popping from the 3.5 mm headphone jack.
+
+**Cause:** the codec is running at 44,100 Hz. It wants 48,000 Hz.
+
+**The trap that costs people an evening:** switching the rate in Audio MIDI
+Setup while audio is playing is **not** a valid test. The codec path is only
+fully reprogrammed when the audio engine is rebuilt — so after changing the
+rate you must **sleep and wake the machine** (or reboot) before judging it. A
+live switch will falsely tell you the sample rate wasn't the problem.
+
+**The fix:** Open **Audio MIDI Setup** (Applications → Utilities), select your
+output device, set Format to **48,000 Hz**, then sleep and wake the machine.
+
+**Make it permanent** — macOS forgets this after preference wipes and NVRAM
+resets, so pin it at every login. From the top of your LatSOFAudio checkout
+(`cd ~/LatSOFAudio` or wherever you cloned it in step 1):
 
 ```sh
 clang -O2 -framework CoreAudio -framework CoreFoundation \
       -o latsof-setrate contrib/latsof-setrate.c
+mkdir -p ~/Library/"Application Support"/LatSOF
+cp latsof-setrate ~/Library/"Application Support"/LatSOF/
 ```
 
-**Speakers or playback misbehave after experimenting with the source** —
-read "The interrupt-starvation bug" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md) before changing anything about
-interrupts; the stock driver enables none, deliberately.
+Then create the LaunchAgent. Paste this whole block into Terminal as-is — it
+writes the file for you with your real home-directory path filled in (don't
+use TextEdit for this; it saves rich text and corrupts plists):
+
+```sh
+mkdir -p ~/Library/LaunchAgents
+cat > ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hackintosh.latsof.setrate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$HOME/Library/Application Support/LatSOF/latsof-setrate</string>
+        <string>48000</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+plutil -lint ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
+```
+
+The `plutil` line must print `OK`. Then load it:
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
+```
+
+**No output means it worked.** Verify with
+`launchctl list | grep latsof` — an entry should appear. If you run the
+bootstrap command a second time you'll get `Bootstrap failed: 5: Input/output
+error` — that just means it's already loaded, not that anything is broken.
+
+`CodecCommander.kext` is also worth having in your EFI for jack-related pops,
+but it does **not** fix this particular problem — the sample rate does.
+
+## 8. Siri
+
+Siri works with this driver as of the July 2026 kernel-audio release, on the
+bare laptop with nothing plugged in.
+
+First, make sure Siri is actually enabled: System Settings → Apple
+Intelligence & Siri → turn **Siri** on and pick an activation shortcut. Don't
+be alarmed that **Apple Intelligence** itself is absent or greyed out in that
+same pane — it is hardware-gated by Apple (T2 / Apple silicon) and no driver
+can change that. Siri and Apple Intelligence are separate things; only Siri
+is on offer here.
+
+If Siri misbehaves, work through these in order — the first two are settings,
+not bugs.
+
+**"Siri Not Available — Connect a microphone"**
+
+1. Confirm the mic itself works (Dictation test in step 5). If Dictation
+   fails, this is a driver problem, not a Siri problem — go to Troubleshooting.
+2. Confirm you are running the kernel-audio build. Older builds published the
+   mic from a since-retired userspace plugin that never advertised the
+   `'imic'` data source Siri requires:
+
+   ```sh
+   ioreg -rc LatSOFKernelAudioDevice -w0 | head -2
+   ```
+
+   No output means you're on an old build; rebuild and reinstall.
+3. Check what Siri actually chose:
+
+   ```sh
+   log show --last 5m --predicate 'process == "corespeechd"' --style compact \
+     | grep -i recordroute | tail -3
+   ```
+
+   `RecordRoute: LatSOFKernelAudioEngine:0` means Siri selected our
+   microphone.
+
+**Siri answers on screen but doesn't speak**
+
+System Settings → Apple Intelligence & Siri → **Siri Responses** → turn on
+**Voice feedback**. It is off by default on some installs and produces exactly
+this symptom.
+
+**Siri hears nothing and gives up (any microphone)**
+
+Check DNS before blaming audio. A poisoned resolver entry pointing
+`guzzoni.apple.com` (Siri's speech endpoint) at `0.0.0.0` makes every request
+fail server-side regardless of microphone:
+
+```sh
+dscacheutil -q host -a name guzzoni.apple.com
+```
+
+If you see `0.0.0.0`, fix it with:
+
+```sh
+sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
+```
+
+**Things that are normal and not faults**
+
+- **No listening tone when Siri opens.** macOS deliberately suppresses the beep
+  for built-in microphones without hardware echo cancellation, so the mic can't
+  hear it. Real MacBooks behave the same way. If you *used* to hear the tone
+  with a USB mic, that was the external-microphone code path.
+- **The log line `supported : 0`** next to your device ID. Ignore it. That
+  check asks whether the device is an Apple Studio Display; every microphone in
+  the world fails it.
+
+**Why this needed a kernel driver at all:** Siri only accepts a built-in-type
+device if it advertises an *input data source* of `'imic'` ("internal
+microphone"). USB devices skip that check entirely — which is why a USB mic
+always worked. The kext publishes the `'imic'` selector so the internal mics
+qualify. Details in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## 9. Uninstalling
+
+**Remove the kext:**
+
+```sh
+sudo rm -rf /Library/Extensions/LatSOFAudio.kext
+```
+
+Reboot. macOS rebuilds the auxiliary collection from what's present in
+`/Library/Extensions`, so the driver is gone after the restart.
+
+**Coming from the old HAL-plugin version?** Remove it, or the two will fight
+over the same DMA ring and each one's stop will kill the other:
+
+```sh
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/LatSOFAudioPlugin.driver
+sudo killall coreaudiod
+```
+
+Also set the `LatSOFAudio.kext` entry in your `config.plist` under
+`Kernel → Add` to `Enabled = false`.
+
+## 10. Troubleshooting
+
+**Build fails: `No rule to make target ... sof-cml.ri`** — the firmware is
+missing or misplaced. Step 2; the path must be exactly
+`kext/LatSOFAudio/Firmware/sof-cml.ri`.
+
+**Any `kmutil` command complains "Missing Developer Kit … KDK matching your
+build"** — you ran `kmutil install --update-all` (or another collection-wide
+subcommand) instead of `kmutil load -p`. Use `kmutil load -p` as shown in
+step 4; the KDK is never needed on this path.
+
+**Kext absent from `kmutil showloaded` after reboot** — in order:
+
+1. Is SIP allowing unsigned kexts? `nvram -p | grep csr-active-config` (step 0).
+2. Is it actually in the collection? `kmutil inspect | grep -i latsof`.
+3. Did macOS block it? System Settings → Privacy & Security → **Allow**.
+4. Is ownership right? `ls -ld /Library/Extensions/LatSOFAudio.kext` must show
+   `root wheel`.
+5. Are you accidentally *also* injecting it from EFI? Disable that entry
+   (step 6).
+
+**Kext loaded but no microphone in Sound settings** —
+
+```sh
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep Status
+```
+
+`"Status" = "OK"` means the DSP booted. If the status says anything else, the
+firmware didn't load — wrong firmware generation (step 2) or wrong hardware
+(step 0). If status is OK but no device appears, check the audio side:
+
+```sh
+ioreg -rc LatSOFKernelAudioEngine -w0 | grep IOAudioEngineState
+```
+
+**Two "internal microphone" entries / level meter dead** — you selected the
+device literally named "Internal Microphone", which is AppleHDA's codec path
+and records silence on this hardware. Select **LatSOF DMIC capture** instead
+(step 5). The dead entry's presence is normal.
+
+**Microphone present but records silence (and you did select LatSOF DMIC
+capture)** — wrong firmware (must be IPC3 `sof-cml`), or your board's mics
+aren't on the DSP (step 0 / `PORTING.md`).
+
+**Microphone permission prompts never appear / Privacy → Microphone is
+empty** — you have `amfi=0x80` in your boot-args. Remove it; it breaks TCC
+prompts system-wide. If something else in your EFI needs AMFI relaxed
+(OCLP-patched Wi-Fi is the usual culprit), use
+[AMFIPass](https://github.com/acidanthera/AMFIPass) instead.
+
+**The mic wedges after a video call** (device present, meter dead) — the
+driver self-heals: it detects the wedged DSP and rebuilds it within a few
+seconds. If it doesn't come back, check for a recovery attempt:
+
+```sh
+log show --last 10m --predicate 'process == "kernel"' --style compact \
+  | grep -i "latsof.*recover"
+```
+
+**Speakers or playback misbehave after you modified the source** — read "The
+interrupt-starvation bug" and "The borrowed-stream contract" in
+[`ARCHITECTURE.md`](ARCHITECTURE.md). The stock driver enables no interrupts,
+deliberately, and hands AppleHDA's borrowed stream back byte-identical.
+
+**Something else** — open an issue with: your `ioreg -rc LatSOFAudioDevice -d 1`
+output, `kmutil showloaded | grep -i latsof`, your macOS build
+(`sw_vers`), and your laptop model and codec.

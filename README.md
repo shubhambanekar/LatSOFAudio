@@ -8,20 +8,24 @@ internal mic under macOS: the mics are wired to the Intel Smart Sound DSP
 (PCI `8086:02c8`), which Apple has no driver for, and on many boards
 (including this one, ALC236) the codec has **no analog mic pin at all** —
 so the headset jack cannot carry a mic either. This project boots the open
-SOF firmware (Sound Open Firmware, Intel's open-source DSP firmware) on that DSP, builds a DMIC capture pipeline, and publishes the
-result to macOS as a normal CoreAudio input device.
+SOF firmware (Sound Open Firmware, Intel's open-source DSP firmware) on that
+DSP, builds a DMIC capture pipeline, and publishes the result to macOS as a
+normal CoreAudio input device.
 
-**Status: working.** 48 kHz / 2-channel stereo capture, QuickTime recording,
-system-wide Dictation, live input metering, survives sleep/wake, runs under
-**stock AMFI** with no security boot-args.
+**Status: working.** 48 kHz / 2-channel stereo capture — QuickTime, system
+Dictation, FaceTime, browser conferencing, live input metering, and **Siri**,
+on the bare laptop with nothing plugged in. Survives sleep/wake, self-heals if
+the DSP wedges, and runs under stock AMFI with no security boot-args.
 
-To the author's knowledge this is the first working internal-DMIC capture
-path on macOS for this platform.
+To the author's knowledge this is the first working internal-DMIC capture path
+on macOS for this platform — and the first documentation anywhere of what
+macOS actually requires before it will let Siri use a microphone (see
+[Siri](#siri) below).
 
 ## Quick start
 
-The complete path, assuming a working OpenCore hackintosh (details, the
-exact `config.plist` entry, and troubleshooting in [`INSTALL.md`](INSTALL.md)):
+Assuming a working OpenCore hackintosh. Full walkthrough, including SIP
+requirements and troubleshooting, in [`INSTALL.md`](INSTALL.md).
 
 ```sh
 xcode-select --install        # once, if you don't have Command Line Tools
@@ -30,54 +34,139 @@ cd LatSOFAudio
 # supply the firmware — see "Firmware" below for where to get it:
 cp /path/to/sof-cml.ri kext/LatSOFAudio/Firmware/
 cd kext && make               # produces LatSOFAudio.kext
+
+sudo ditto LatSOFAudio.kext /Library/Extensions/LatSOFAudio.kext
+sudo chown -R root:wheel /Library/Extensions/LatSOFAudio.kext
+sudo chmod -R 755 /Library/Extensions/LatSOFAudio.kext
+sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
 ```
 
-Copy `LatSOFAudio.kext` into `EFI/OC/Kexts`, add the `Kernel → Add` entry
-shown in `INSTALL.md`, and reboot. Then:
+That last command printing `Code=28 … requires a reboot` is **success**.
+Reboot, then pick **LatSOF DMIC capture** in System Settings → Sound → Input.
 
-```sh
-cd plugin && make install     # builds, signs, verifies, restarts coreaudiod
-```
-
-Finally pick **LatSOF Internal Microphone** in System Settings → Sound →
-Input, and test with a QuickTime audio recording.
+> ### The kext does *not* go in your EFI
+>
+> This is the one thing people get wrong, and it fails **silently** — no error
+> anywhere, the kext simply never loads.
+>
+> The driver depends on Apple's `IOAudioFamily`, which lives in the *System*
+> kernel collection. OpenCore injects into the *Boot* collection and can only
+> link against that, so it drops the bundle without a word. Installing to
+> `/Library/Extensions` lets macOS's own linker — which can see every
+> collection — do the job. If you have an old `Kernel → Add` entry for
+> `LatSOFAudio.kext`, disable it.
 
 ## Which name is which
 
 | You will see | What it is |
 |---|---|
-| `LatSOFAudio.kext` | the kernel driver — goes in `EFI/OC/Kexts` |
-| `LatSOFAudioPlugin.driver` | the CoreAudio plugin — installed for you by `make install` |
-| `LatSOFAudioDevice` | the kext's IOKit class — what you query with `ioreg` |
-| **LatSOF Internal Microphone** | the input device you select in Sound settings |
-| Internal Microphone (Built-in) | AppleHDA's dead codec path — *not* this driver; records silence |
+| `LatSOFAudio.kext` | the driver — goes in **`/Library/Extensions`**, not your EFI |
+| `LatSOFAudioDevice` | the hardware/DSP IOKit class — what you query with `ioreg` |
+| `LatSOFKernelAudioDevice` | the audio device it publishes to CoreAudio |
+| **LatSOF DMIC capture** | the input device you select in Sound settings |
+| `LatSOFAudioPlugin.driver` | **retired.** The old userspace HAL plugin, replaced by the kernel audio engine. Source kept under `plugin/` for reference; do not install it alongside the kext |
 
 ## How it works (short version)
 
-Two components:
+One kext, two halves:
 
-1. **`LatSOFAudio.kext`** — boots SOF firmware on the DSP and runs the DMIC
-   capture DMA. Crucially, it does **not** claim the PCI device: it matches
-   `IOResources` and locates the HDA controller by registry walk, so
+1. **The DSP half** (`LatSOFAudioDevice`) boots SOF firmware on the DSP and
+   runs the DMIC capture DMA. Crucially, it does **not** claim the PCI device:
+   it matches `IOResources` and locates the HDA controller by registry walk, so
    **AppleHDA keeps working** — speakers, headphones and AppleALC are
    untouched. The two drivers share the controller by partitioning stream
-   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2),
-   with one carefully-managed exception: during each firmware load the code
-   loader briefly borrows AppleHDA's first output descriptor and hands it
-   back byte-identical (see the FAQ, and "The borrowed-stream contract" in
-   `ARCHITECTURE.md`).
+   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2), with
+   one carefully-managed exception: during each firmware load the code loader
+   briefly borrows AppleHDA's first output descriptor and hands it back
+   byte-identical (see the FAQ, and "The borrowed-stream contract" in
+   [`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
-2. **`LatSOFAudioPlugin.driver`** — a userspace CoreAudio HAL plugin
-   (input-only) that maps the kext's capture ring and publishes
-   "LatSOF Internal Microphone" as a system input device, with volume
-   control, software gain and a DC-blocking high-pass.
+2. **The audio half** (`LatSOFKernelAudioDevice` / `LatSOFKernelAudioEngine`)
+   publishes that capture ring to CoreAudio as a kernel `IOAudioEngine` —
+   zero-copy, with software gain and a DC-blocking high-pass, back-dated
+   timestamps, and the `'imic'` data source that makes macOS treat it as a real
+   built-in microphone.
 
 Full details in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-For how it was actually built — including the wrong turns, the machine hang, the
-signing misdiagnosis, and the interrupt bug that presented as somebody else's
-playback failing — see [`DEBUGGING-LOG.md`](DEBUGGING-LOG.md). If you are
-porting this, that file will save you more time than this one.
+For how it was actually built — including the wrong turns, the machine hang,
+the signing misdiagnosis, the interrupt bug that presented as somebody else's
+playback failing, and the night Siri finally worked — see
+[`DEBUGGING-LOG.md`](DEBUGGING-LOG.md). If you are porting this, that file will
+save you more time than this one.
+
+## Siri
+
+**Siri works on the internal microphone.** This took a kernel driver and a
+disassembler to figure out, and the answer isn't documented anywhere else, so
+here it is in full.
+
+macOS decides whether a microphone is acceptable to Siri like this:
+
+- If the device's **transport type** is `'usb '`, `'blue'` or `'line'`, it is
+  accepted with no further questions. *This is the only reason USB microphones
+  always work.*
+- If the transport type is `'bltn'` (built-in), the device must **also**
+  publish an input-scope **data source** of `'imic'` (internal microphone) —
+  otherwise CoreSpeech nils the route and the panel says **"Siri Not Available
+  — Connect a microphone."** (CoreSpeech itself would also accept `'emic'`,
+  but AVFAudio's built-in-microphone lookup — the path behind voice
+  activation — demands `'imic'` specifically, so publish `'imic'`.)
+- Anything else is rejected outright.
+
+The driver satisfies this by publishing an `IOAudioSelectorControl` whose
+single selection is `'imic'` — the same mechanism AppleHDA uses to advertise
+its speakers as `'ispk'`.
+
+Two traps for anyone debugging this themselves:
+
+- **The log line `AVVCAudioDeviceManager.mm:723 … supported : 0` is a red
+  herring.** That function checks whether the device's ModelUID contains
+  `05AC:1114` — the USB ID of the Apple Studio Display. Every microphone on
+  earth returns 0, including the one in a real MacBook.
+- **The property-read failures `doml` and `crss` in the log are the actual
+  message.** Those fourccs are byte-reversed: `crss` is `ssrc`
+  (`kAudioDevicePropertyDataSource`) and `doml` is `lmod`
+  (`kAudioObjectPropertyModelName`). If you see those failing, you have found
+  your bug.
+
+An earlier version of this README asserted that Siri admits only
+kernel-published devices and rejects userspace `AudioServerPlugIn` devices *by
+class*. **That was wrong.** The gate is purely HAL properties, and is identical
+for kexts, HAL plugins and DriverKit drivers — the old plugin here failed for
+want of an `'imic'` data source, not for being userspace. The kernel port is
+still the right destination (AMFI blocks the unsigned plugin on this machine,
+and IOAudioFamily provides the selector, transport and terminal-type plumbing
+for free), but the stated reason was wrong for weeks and is corrected here.
+
+**Normal behavior that looks broken:** there is no listening tone when Siri
+opens. macOS suppresses the beep on built-in microphones without hardware echo
+cancellation so the mic can't hear itself. Real MacBooks do the same.
+
+**If Siri answers on screen but doesn't speak:** System Settings → Apple
+Intelligence & Siri → Siri Responses → turn on **Voice feedback**. It is off by
+default on some installs.
+
+**If Siri hears nothing on *any* microphone,** check DNS before blaming audio:
+`dscacheutil -q host -a name guzzoni.apple.com`. A poisoned cache entry
+pointing Siri's speech endpoint at `0.0.0.0` fails every request server-side.
+Fix with `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`.
+
+## Headphone crackle (not a microphone problem, but read this)
+
+Static or crackling from the 3.5 mm jack on ALC laptops is almost always the
+classic **44.1 kHz problem**: set the output to **48,000 Hz** in Audio MIDI
+Setup.
+
+**The trap:** changing the rate live is *not* a valid test. The codec path is
+only fully reprogrammed when the audio engine is rebuilt, so you must **sleep
+and wake the machine (or reboot)** before judging whether it worked. A live
+switch produces a false negative that cost this project an evening.
+
+To make it survive preference wipes and NVRAM resets, `contrib/latsof-setrate.c`
+pins the rate at login — full recipe in [`INSTALL.md`](INSTALL.md) §7.
+`CodecCommander.kext` helps with jack pops but does **not** fix this; the
+sample rate does.
 
 ## A note on naming
 
@@ -85,25 +174,26 @@ Everything in this tree carries the `LatSOF` prefix — bundle, identifiers,
 classes, files. The parent project it derives from is DexterSLamb's
 **CmlSOFAudio** (*Cml* for Comet Lake); that name appears in this repository
 only when referring to the parent. Attribution lives in
-[`CREDITS.md`](CREDITS.md), [`NOTICE`](NOTICE), and the plugin's source
-header. Use `LatSOFAudioDevice` when querying the driver with `ioreg`.
+[`CREDITS.md`](CREDITS.md), [`NOTICE`](NOTICE), and the plugin's source header.
 
 ## Requirements
 
 - Comet Lake laptop with SOF-attached PDM DMICs (verify on Linux first —
   see [`PORTING.md`](PORTING.md); if your mic records under Linux with the
   `sof-cml` firmware, you have the right hardware)
-- OpenCore with the usual unsigned-kext setup (this is standard hackintosh
-  territory; nothing beyond what your EFI already does)
-- macOS Sequoia (15.x tested; other versions unverified)
-- Command Line Tools (to build the kext and the HAL plugin)
+- OpenCore with the usual unsigned-kext setup, and **SIP relaxed enough to
+  load unsigned kexts** (`csr-active-config` with bit `0x1` set; `0x803` is
+  the common hackintosh value and works)
+- macOS Sequoia (15.x tested; other versions unverified — see
+  [macOS Tahoe](#a-word-on-macos-tahoe-26) below)
+- Command Line Tools (to build the kext)
 - **The SOF firmware blob, which is not in this repo** — see "Firmware" below.
   The kext will not build without it.
 - **No** `amfi=0x80`, **no** library-validation overrides — the driver runs
   under stock enforcement. In fact `amfi=0x80` will *break* microphone
   permission prompts system-wide; if something else in your EFI needs AMFI
   relaxed (OCLP-patched Wi-Fi is the usual culprit), use
-  [AMFIPass](https://github.com/dortania/OpenCore-Legacy-Patcher) instead.
+  [AMFIPass](https://github.com/acidanthera/AMFIPass) instead.
 
 ## Reference hardware
 
@@ -134,11 +224,6 @@ microphone pin at all, so the only path to the internal mics is through the
 DSP — which is the entire reason this driver exists. A machine with the same
 CPU but mics wired to the codec does not need any of this.
 
-The graphics row is listed because it is the usual follow-up question: this is
-a pure-iGPU laptop, no dGPU to disable or spoof, and the `-igfx*` boot-args in
-`INSTALL.md` are WhateverGreen options for the UHD Graphics, unrelated to
-audio.
-
 ## Firmware — you must supply this yourself
 
 `sof-cml.ri` is **not distributed here**. The kext embeds it at build time, so
@@ -152,137 +237,123 @@ it, and place it at exactly:
 Use the **IPC3** generation. Newer IPC4 firmware speaks a different protocol
 than this driver.
 
-## Install
-
-See [`INSTALL.md`](INSTALL.md). Short form: kext into `EFI/OC/Kexts` plus a
-`Kernel → Add` entry, then `make install` in `plugin/` — the Makefile
-handles code-signing, permissions and verification, and refuses to restart
-`coreaudiod` unless the installed bundle verifies.
-
 ## Known limitations
 
 - **Input only.** Playback stays with AppleHDA/AppleALC by design.
-- **Input latency is reported as 0 and has not been reliably measured.** Echo
-  cancellation in conferencing apps adapts to the real delay and works fine in
-  practice (verified on FaceTime calls), but the reported value is wrong. See
-  the note in `ARCHITECTURE.md` on why measuring it needs a second, trusted
-  input device.
-- Apple's "Ambient noise reduction" checkbox will not appear for this
-  device — that processing lives inside Apple's own built-in-mic driver
-  and cannot be requested by third-party devices. A DC-blocking high-pass
-  is built in; app-level suppression (Zoom, Teams, etc.) works normally.
-- You will see **two** "Internal Microphone"-ish entries in Sound settings:
-  the `Built-in` one is AppleHDA's dead codec path (it records silence on
-  this hardware with or without this driver); select **LatSOF Internal
-  Microphone**.
-- "Hey Siri" and Apple Intelligence are hardware-gated by Apple (T2 /
-  Apple silicon) and are not fixable by any driver.
-- **Siri by voice: check your DNS before blaming audio.** On this machine
-  the sphere opened, heard nothing and closed on every attempt — and the
-  terminal cause turned out to be a poisoned resolver cache entry sending
-  `guzzoni.apple.com` (Siri's voice-recognition endpoint) to `0.0.0.0`, so
-  the audio stream was refused server-side no matter which microphone
-  captured it. `sudo dscacheutil -flushcache && sudo killall -HUP
-  mDNSResponder` fixed it; voice Siri then worked immediately. Diagnose
-  with `dscacheutil -q host -a name guzzoni.apple.com` — if you see
-  `0.0.0.0`, that's your problem, not the driver.
-- **Siri's device selection never picks this driver's mic.** A real,
-  separate issue uncovered along the way: `corespeechd` hunts for a record
-  device itself, ignoring the default-input setting, and prefers — in
-  observed order — USB inputs, then AppleHDA's **dead** "Built-in
-  Microphone" (present because the codec layout defines input paths for a
-  codec with no mic wired to it), and never this driver's device. It stores
-  no editable preference, refuses to be hidden, and does not fall back if
-  its pick is made unopenable. In practice: **voice Siri works with any USB
-  microphone attached** (Siri routes to it); on the bare laptop it records
-  the dead device and hears silence. Dictation, QuickTime and FaceTime all
-  honor the default input and work with the internal mics (Dictation stores
-  this device's UID explicitly). **Type to Siri always works.**
+- **Input latency is reported as 240 frames (5 ms) and is provisional** — a
+  best estimate of the pipeline delay, not a measurement. Echo cancellation in
+  conferencing apps adapts to the real delay and works in practice; the
+  reported number will be refined once measured against a trusted second input.
+- Apple's "Ambient noise reduction" checkbox will not appear for this device —
+  that processing lives inside Apple's own built-in-mic driver and cannot be
+  requested by third-party devices. A DC-blocking high-pass is built in;
+  app-level suppression (Zoom, Teams, etc.) works normally.
+- **Voice Isolation / Wide Spectrum** mic modes are likewise Apple-internal.
+- **Apple Intelligence** is hardware-gated (T2 / Apple silicon) and no driver
+  can change that. Siri itself works.
+- **You may see a second, dead "Internal Microphone"** in Sound settings —
+  that's AppleHDA's codec path, which records silence on this hardware because
+  no mic is wired to the codec. An output-only AppleALC layout removes it; see
+  the next section.
 
-  **The gamble was run and the answer is definitive (28 Jul, custom
-  output-only AppleALC layout — next bullet): even as the ONLY input
-  device in the system, this driver's mic is invisible to Siri.** The
-  sphere reports "Siri Not Available — Connect a microphone" while the
-  audio-session layer touches the device by UID in the same log window;
-  `corespeechd`'s selection returns `deviceId = (null)`. Conclusion:
-  Siri's selector admits only kernel-published audio devices
-  (`IOAudioFamily` — AppleHDA, USB audio) and excludes userspace
-  AudioServerPlugIn devices by class; no layout, preference or property
-  changes that from user space. The one real path to bare-laptop voice
-  Siri is publishing the capture stream as a kernel `IOAudioEngine` from
-  the kext — the API family USB mics use, which demonstrably passes the
-  filter. A substantial, defined future project; not a configuration fix.
+## Side results that may be useful elsewhere
 
-- **An output-only codec layout works on Sequoia** — a side result
-  believed to be a first: an AppleALC layout for the ALC236 with **zero
-  input paths** (id 90 in this project's fork) boots and runs — the
-  analog output engine publishes, speakers/headphones and jack switching
-  work, and the phantom input devices are gone from every app's device
-  picker. Sequoia's AppleHDA does not require an ADC path in an analog
-  PathMap. Useful for any dead-codec DMIC board wanting an honest device
-  list; a candidate for upstreaming to AppleALC.
+- **An output-only codec layout works on Sequoia** — believed to be a first: an
+  AppleALC layout for the ALC236 with **zero input paths** (id 90 in this
+  project's fork) boots and runs. The analog output engine publishes,
+  speakers/headphones and jack switching work, and the phantom input devices
+  are gone from every app's device picker. Sequoia's AppleHDA does not require
+  an ADC path in an analog PathMap. Useful for any dead-codec DMIC board
+  wanting an honest device list; a candidate for upstreaming to AppleALC.
+- **The full `'imic'` recipe for Siri acceptance** (see [Siri](#siri)) applies
+  to any third-party macOS audio driver — kext, HAL plugin or DriverKit —
+  wanting to be treated as a built-in microphone.
+- **Self-healing DSP recovery.** If a capture IPC times out (observed after
+  some WebRTC sessions), the driver rebuilds the DSP automatically within a few
+  seconds, bounded to three attempts so a genuinely dead firmware can't spin
+  forever.
+
+## A word on macOS Tahoe (26)
+
+**This driver has not been tested on Tahoe, and Tahoe removes AppleHDA
+entirely.** Since this project's design depends on AppleHDA being present —
+both for playback and for the borrowed stream used during firmware load — you
+should assume the whole stack needs AppleHDA restored (the community does this
+by root-patching a KDK-extracted AppleHDA back onto the system volume) before
+this driver has anything to coexist with. That patch is erased by every macOS
+update and must be reapplied.
+
+`IOAudioFamily` itself does still ship in Tahoe, so the driver is not
+architecturally blocked — but treat Tahoe as an experiment on a spare volume,
+not an upgrade. Apple is steering third-party audio toward AudioDriverKit, so a
+DriverKit port is this project's likely long-term direction.
 
 ## FAQ
 
-**Will this work on my laptop?** Only on Comet Lake machines with
-SOF-attached DMICs — and you can find out in five minutes with a Linux
-live USB before building anything: [`PORTING.md`](PORTING.md) §0.
+**Will this work on my laptop?** Only on Comet Lake machines with SOF-attached
+DMICs — and you can find out in five minutes with a Linux live USB before
+building anything: [`PORTING.md`](PORTING.md) §0.
 
-**Do I need to change any code for my machine?** On a Dell Latitude 3410,
-no. On any other board, every machine-specific value is catalogued in
-`PORTING.md` §3a ("Board-specific values"); the DMIC topology messages
-must be adapted to your own NHLT table, which is the real work of a
-port.
+**Do I need to change any code for my machine?** On a Dell Latitude 3410, no.
+On any other board, every machine-specific value is catalogued in `PORTING.md`
+§3a ("Board-specific values"); the DMIC topology messages must be adapted to
+your own NHLT table, which is the real work of a port.
 
-**Is there a prebuilt kext to download?** Not yet — building takes about
-two minutes (Quick start above). A prebuilt would also embed the firmware
-blob, and that redistribution decision is still open.
+**Is there a prebuilt kext to download?** Not yet — building takes about two
+minutes (Quick start above). A prebuilt would also embed the firmware blob, and
+that redistribution decision is still open.
 
-**Do I need to disable SIP or add security boot-args?** Nothing beyond
-what your working OpenCore setup already does. Do **not** add
-`amfi=0x80` — it breaks microphone permission prompts system-wide.
+**Why doesn't it go in my EFI like every other kext?** Because it links
+`IOAudioFamily`, which OpenCore can't resolve. See the box in Quick start.
 
-**Will this break my speakers?** Using it: no — coexisting with AppleHDA
-is the entire design. The driver services no interrupts, and the one shared
-resource it uses — AppleHDA's first output stream descriptor, which the
-DSP's code loader currently runs over during every firmware load — is
-borrowed under a strict snapshot/restore contract and verified
-byte-identical afterwards (the `SD-Borrow`/`SD-Final` ioreg properties).
-Modifying the interrupt code or the borrow/restore path can absolutely
-break playback: read "The interrupt-starvation bug" and "The
-borrowed-stream contract" in `ARCHITECTURE.md` first.
+**Do I need to disable SIP?** Partially — enough to load unsigned kexts
+(`csr-active-config` bit `0x1`). Most hackintoshes already run `0x803`. Do
+**not** add `amfi=0x80`; it breaks microphone permission prompts system-wide.
 
-**Other macOS versions?** Sequoia 15.x is what's tested. Reports from
-other versions are welcome.
+**Will this break my speakers?** Using it: no — coexisting with AppleHDA is the
+entire design. The driver services no interrupts, and the one shared resource
+it uses — AppleHDA's first output stream descriptor, which the DSP's code
+loader runs over during every firmware load — is borrowed under a strict
+snapshot/restore contract and verified byte-identical afterwards (the
+`SD-Borrow`/`SD-Final` ioreg properties). Modifying the interrupt code or the
+borrow/restore path can absolutely break playback: read "The
+interrupt-starvation bug" and "The borrowed-stream contract" in
+`ARCHITECTURE.md` first.
+
+**Can I keep the old HAL plugin installed too?** No. Two publishers on one DMA
+ring means either one's stop kills the other's capture. Remove the plugin —
+`INSTALL.md` §9.
+
+**Other macOS versions?** Sequoia 15.x is what's tested. Reports from other
+versions are welcome.
 
 ## Safety notes
 
-This is kernel code driving DMA engines on a shared PCI function.
-Understand these before experimenting:
+This is kernel code driving DMA engines on a shared PCI function. Understand
+these before experimenting:
 
-- **Never start capture during boot.** A capture DMA started while
-  AppleHDA is still initialising the same controller hangs the machine.
-  The driver only starts DMA on demand from userspace.
-- Keep a recovery path for EFI edits (another OS that can mount the ESP,
-  or a USB with a known-good EFI).
-- Don't run standalone capture test tools while the HAL device is in use —
+- **Never start capture during boot.** A capture DMA started while AppleHDA is
+  still initialising the same controller hangs the machine. The driver only
+  starts DMA on demand.
+- Keep a recovery path for EFI edits (another OS that can mount the ESP, or a
+  USB with a known-good EFI).
+- Don't run standalone capture test tools while the audio device is in use —
   two masters on one ring, and a stop from either stops both.
 
 ## Credits and license
 
 See [`CREDITS.md`](CREDITS.md) for full attribution.
 
-
 - Fork of [DexterSLamb/CmlSOFAudio](https://github.com/DexterSLamb/CmlSOFAudio)
-  (BSD-3-Clause), originally written for an HP Chromebook with the same
-  DSP generation. The I2S codec path was removed; the DSP boot and DMIC
-  pipeline were kept and re-based for AppleHDA coexistence.
+  (BSD-3-Clause), originally written for an HP Chromebook with the same DSP
+  generation. The I2S codec path was removed; the DSP boot and DMIC pipeline
+  were kept and re-based for AppleHDA coexistence.
 - SOF firmware by the [Sound Open Firmware project](https://thesofproject.github.io/).
-  The firmware binary (`sof-cml.ri`) is **not** included in this repo —
-  obtain it from `sof-bin` releases or `linux-firmware` and check the
-  licence file that ships with it (it is generally redistributable, but
-  verify for yourself).
-- The HAL plugin derives from Apple's `NullAudio` sample code; its
+  The firmware binary (`sof-cml.ri`) is **not** included in this repo — obtain
+  it from `sof-bin` releases or `linux-firmware` and check the licence file
+  that ships with it (it is generally redistributable, but verify for
+  yourself).
+- The retired HAL plugin derives from Apple's `NullAudio` sample code; its
   original license header is retained.
 - All modifications: BSD-3-Clause, same as the parent project.
 
