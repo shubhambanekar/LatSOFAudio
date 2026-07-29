@@ -171,6 +171,12 @@ device change; full recipe in [`INSTALL.md`](INSTALL.md) §7.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
 sample rate does.
 
+**If it still crackles at 48 kHz, it's a different fault.** Constant static on
+every sound is the rate problem above; *occasional* bursts that come and go are
+CoreAudio missing render deadlines — usually caused by CPU throttling under
+Low Power Mode or a low battery, not by audio configuration at all. Both the
+log check and the fix are in [`INSTALL.md`](INSTALL.md) §7.
+
 ## A note on naming
 
 Everything in this tree carries the `LatSOF` prefix — bundle, identifiers,

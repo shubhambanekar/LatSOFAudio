@@ -345,6 +345,41 @@ job.
 `CodecCommander.kext` is also worth having in your EFI for jack-related pops,
 but it does **not** fix this particular problem — the sample rate does.
 
+### If crackle persists at 48 kHz — the other cause
+
+There are two different faults that both sound like "headphone static", and
+fixing the first does nothing for the second:
+
+| | 44.1 kHz fault | dropout fault |
+|---|---|---|
+| Sounds like | constant, on every sound | occasional bursts, comes and goes |
+| Depends on | the sample rate | CPU load / power state |
+| Verify | `system_profiler SPAudioDataType \| grep SampleRate` | the log check below |
+
+The second is CoreAudio missing an audio render deadline. Check for it:
+
+```sh
+log show --last 1h --predicate 'subsystem == "com.apple.coreaudio"' \
+  --style compact | grep -i "overload\|skipping cycle"
+```
+
+A line like `HALC_ProxyIOContext::IOWorkLoop: skipping cycle due to overload`
+is a confirmed dropout — you heard that one.
+
+On a laptop the usual trigger is **power management**, not audio at all:
+
+```sh
+pmset -g | grep -i lowpowermode        # 1 = Low Power Mode is on
+pmset -g batt                          # on battery? low charge?
+```
+
+macOS enables Low Power Mode automatically when the battery gets low, and the
+CPU throttling that follows is enough to make a hackintosh miss audio
+deadlines. Plug in the charger, or turn Low Power Mode off in System Settings
+→ Battery, and see whether the bursts stop. (They are usually more audible in
+headphones than through laptop speakers, which mask short glitches — so
+"headphones only" does not by itself mean the codec is at fault.)
+
 ## 8. Siri
 
 Siri works with this driver as of the July 2026 kernel-audio release, on the
