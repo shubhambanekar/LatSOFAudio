@@ -270,73 +270,41 @@ live switch will falsely tell you the sample rate wasn't the problem.
 **The fix:** Open **Audio MIDI Setup** (Applications → Utilities), select your
 output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 
-**Make it permanent.** macOS does not remember this setting: it resets the
-rate whenever the output engine is rebuilt, which happens **every time you
-plug in or unplug the headphone jack** — so the machine can be clean all day
-and crackle the moment you reach for headphones. A one-shot at login is not
-enough; the tool below runs resident and re-pins on every change.
+> ### Do NOT automate this with a resident rate-pinning agent
+>
+> This was tried on the reference machine, and it **caused a worse fault than
+> the one it fixed.** Measured on 29 July 2026:
+>
+> When the headphone jack is plugged in, AppleHDA rebuilds the output engine
+> and passes *through* 44,100 Hz before settling at 48,000 Hz on its own. A
+> resident watcher that reacts to that transient writes 48,000 Hz **while the
+> codec path is still being programmed for 44,100** — leaving the stream and
+> the codec disagreeing. The result is harsh static on **both** headphones and
+> speakers, curable only by physically replugging the jack (a `coreaudiod`
+> restart does not fix it, because only a real jack event reprograms the codec
+> path).
+>
+> With no watcher running, the same plug settles at 48,000 Hz by itself and
+> sounds clean. The transient is normal behaviour, not a fault to correct.
+>
+> The general lesson, which this project learned twice: **never write the
+> sample rate while the engine is being rebuilt.** If you want a persistent
+> pin, it must wait until the device has been quiet for several seconds and
+> only then correct a rate that is genuinely stuck — the naive version
+> actively breaks audio.
 
-From the top of your LatSOFAudio checkout (`cd ~/LatSOFAudio` or wherever you
-cloned it in step 1):
+**If you ever find the output genuinely stuck at 44,100 Hz** (checked while
+idle, not during a plug), set it once and then rebuild the engine properly:
 
 ```sh
 clang -O2 -framework CoreAudio -framework CoreFoundation \
-      -o latsof-setrate contrib/latsof-setrate.c
-mkdir -p ~/Library/"Application Support"/LatSOF
-cp latsof-setrate ~/Library/"Application Support"/LatSOF/
+      -o latsof-setrate contrib/latsof-setrate.c   # from the repo root
+./latsof-setrate                 # report the current rate
+./latsof-setrate 48000           # pin it once
 ```
 
-Then create the LaunchAgent. Paste this whole block into Terminal as-is — it
-writes the file for you with your real home-directory path filled in (don't
-use TextEdit for this; it saves rich text and corrupts plists):
-
-```sh
-mkdir -p ~/Library/LaunchAgents ~/Library/Logs
-cat > ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.hackintosh.latsof.setrate</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/Library/Application Support/LatSOF/latsof-setrate</string>
-        <string>--watch</string>
-        <string>48000</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$HOME/Library/Logs/latsof-setrate.log</string>
-    <key>StandardErrorPath</key>
-    <string>$HOME/Library/Logs/latsof-setrate.log</string>
-</dict>
-</plist>
-EOF
-plutil -lint ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
-```
-
-The `plutil` line must print `OK`. Then load it:
-
-```sh
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
-```
-
-**No output means it worked.** Verify:
-
-```sh
-launchctl list | grep latsof          # an entry with a PID should appear
-cat ~/Library/Logs/latsof-setrate.log # "watching ... pinning 48000 Hz"
-```
-
-If you run the bootstrap command a second time you'll get `Bootstrap failed:
-5: Input/output error` — that just means it's already loaded, not that
-anything is broken. (To reload after rebuilding the tool: `launchctl bootout
-gui/$(id -u)/com.hackintosh.latsof.setrate` first.)
+Then sleep/wake or replug the jack so the codec path is reprogrammed at the
+new rate. That is the whole fix; no background process required.
 
 From now on that log is your evidence: every time the jack is plugged in you
 should see a line like `44100 -> 48000 (status 0)`, which is the fix doing its

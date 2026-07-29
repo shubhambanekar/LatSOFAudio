@@ -163,11 +163,14 @@ only fully reprogrammed when the audio engine is rebuilt, so you must **sleep
 and wake the machine (or reboot)** before judging whether it worked. A live
 switch produces a false negative that cost this project an evening.
 
-**And it comes back.** macOS resets the rate every time the output engine is
-rebuilt — most notably **whenever the headphone jack is plugged in or
-unplugged** — so a one-shot fix at login is lost exactly when you reach for
-headphones. `contrib/latsof-setrate.c` runs resident and re-pins on every
-device change; full recipe in [`INSTALL.md`](INSTALL.md) §7.
+**Do not automate the pin with a resident agent.** Plugging the jack makes
+AppleHDA rebuild the engine, and it passes *through* 44.1 kHz before settling
+at 48 kHz by itself. A watcher that "corrects" that transient writes the rate
+while the codec is still being programmed, leaving stream and codec
+disagreeing — harsh static on headphones **and** speakers, curable only by
+physically replugging. This was measured here, the hard way: the automation
+caused a worse fault than the one it fixed. Details and the safe manual
+procedure in [`INSTALL.md`](INSTALL.md) §7.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
 sample rate does.
 
