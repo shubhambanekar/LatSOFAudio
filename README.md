@@ -238,6 +238,17 @@ CoreAudio missing render deadlines — usually caused by CPU throttling under
 Low Power Mode or a low battery, not by audio configuration at all. Both the
 log check and the fix are in [`INSTALL.md`](INSTALL.md) §7.
 
+**Crackling in FaceTime and other call apps is a third fault, with an instant
+cure.** This microphone is 48 kHz only, and some apps drag the *output* to
+44.1 kHz when a call starts. CoreAudio then bridges two engines running at
+different rates and its IO thread misses deadlines — measured at 746 overloads
+in 60 seconds during a FaceTime call, all from FaceTime's own audio daemon on
+an otherwise idle machine. Run `latsof-setrate 48000` **during the call**; the
+overloads stop within the same second. This is the one case where a live rate
+change is the fix rather than a false lead, because nothing depends on
+reprogramming the codec — only on the two engines agreeing. Full details in
+[`INSTALL.md`](INSTALL.md) §7.
+
 ## A note on naming
 
 Everything in this tree carries the `LatSOF` prefix — bundle, identifiers,
