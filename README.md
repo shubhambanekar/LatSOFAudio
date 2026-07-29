@@ -42,6 +42,17 @@ sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
 ```
 
 That last command printing `Code=28 … requires a reboot` is **success**.
+
+If it prints `Code=27 … not approved to load` instead, macOS is waiting on
+you: System Settings → Privacy & Security, scroll to the **bottom**, click
+**Allow**, enter your password, then run the same `sudo kmutil load -p …`
+command again — it should now report `Code=28`. With `0x803`, the common
+hackintosh `csr-active-config`, this prompt appears on the first install **and
+again after every rebuild**, because the new binary has a new UUID. Using
+`0xA03` instead (`030A0000` in the plist — see [`INSTALL.md`](INSTALL.md) §0)
+adds the skip-approval bit and retires the prompt for good, at the cost of one
+more SIP bit lowered.
+
 Reboot, then pick **LatSOF DMIC capture** in System Settings → Sound → Input.
 
 > ### The kext does *not* go in your EFI
@@ -55,6 +66,41 @@ Reboot, then pick **LatSOF DMIC capture** in System Settings → Sound → Input
 > `/Library/Extensions` lets macOS's own linker — which can see every
 > collection — do the job. If you have an old `Kernel → Add` entry for
 > `LatSOFAudio.kext`, disable it.
+## Updating to a newer build
+
+Don't copy a new kext over the old one — remove it first, and check the hash.
+Run this from the `kext/` directory where `make` left the new bundle:
+
+```sh
+sudo rm -rf /Library/Extensions/LatSOFAudio.kext
+sudo ditto LatSOFAudio.kext /Library/Extensions/LatSOFAudio.kext
+md5 -q LatSOFAudio.kext/Contents/MacOS/LatSOFAudio                      # the new build
+md5 -q /Library/Extensions/LatSOFAudio.kext/Contents/MacOS/LatSOFAudio  # what landed
+sudo chown -R root:wheel /Library/Extensions/LatSOFAudio.kext
+sudo chmod -R 755 /Library/Extensions/LatSOFAudio.kext
+sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
+```
+
+The two hashes must match. That check is not paranoia: a `ditto` onto an
+existing bundle has been observed here to report success and leave the **old**
+binary in place, and nothing else catches it.
+
+**Expect the approval prompt again.** The binary changed, so macOS sees a new
+extension and `kmutil` answers `Code=27 … not approved to load` instead of the
+`Code=28` that means success. Open System Settings → Privacy & Security, scroll
+to the **bottom**, click **Allow**, then re-run the same `kmutil load -p`
+command — it should give `Code=28`. This recurs on every build whose binary
+differs; see [`INSTALL.md`](INSTALL.md) §4.
+
+Quit anything that's playing audio before you load. Loading the kext while
+AppleHDA is mid-stream can hijack that stream and produce loud static on the
+speakers, curable only by physically replugging the jack.
+
+Then reboot — `kmutil showloaded` reports the kext that is *running*, which is
+the old one until you do; `kmutil inspect` is what shows you the bundle staged
+on disk. Verify with the three checks in [`INSTALL.md`](INSTALL.md) §5. Keep the
+previous bundle: rolling back is this same procedure with the old kext
+(§9 removes the driver outright).
 
 ## Which name is which
 
@@ -160,8 +206,14 @@ Setup.
 
 **The trap:** changing the rate live is *not* a valid test. The codec path is
 only fully reprogrammed when the audio engine is rebuilt, so you must **sleep
-and wake the machine (or reboot)** before judging whether it worked. A live
-switch produces a false negative that cost this project an evening.
+and wake the machine, unplug and replug the jack, or reboot** before judging
+whether it worked. A live switch produces a false negative that cost this
+project an evening.
+
+**Booting with headphones already plugged in** is the case where the engine
+can come up at 44.1 kHz and *stay* there — replugging alone just rebuilds at
+44.1 again. The order is the whole trick: pin 48 kHz *first*, replug *after*.
+Full procedure in [`INSTALL.md`](INSTALL.md) §7.
 
 **Do not automate the pin with a resident agent.** Plugging the jack makes
 AppleHDA rebuild the engine, and it passes *through* 44.1 kHz before settling
@@ -169,8 +221,14 @@ at 48 kHz by itself. A watcher that "corrects" that transient writes the rate
 while the codec is still being programmed, leaving stream and codec
 disagreeing — harsh static on headphones **and** speakers, curable only by
 physically replugging. This was measured here, the hard way: the automation
-caused a worse fault than the one it fixed. Details and the safe manual
-procedure in [`INSTALL.md`](INSTALL.md) §7.
+caused a worse fault than the one it fixed. Concretely: the helper in
+`contrib/latsof-setrate.c` still carries a `--watch` mode, and that mode *is*
+the retracted agent — never run it, and never wrap it in a LaunchAgent,
+whatever that file's header comment still suggests. The supported use is the
+one-shot `latsof-setrate 48000` (installed to `/usr/local/bin`), followed by a
+replug or a sleep/wake — pinning the rate alone never reprograms the codec
+path. How to build and install it, and the rest of the detail, live in
+[`INSTALL.md`](INSTALL.md) §7.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
 sample rate does.
 
@@ -347,6 +405,12 @@ these before experimenting:
 - **Never start capture during boot.** A capture DMA started while AppleHDA is
   still initialising the same controller hangs the machine. The driver only
   starts DMA on demand.
+- **Don't hot-load the kext while audio is playing.** Every firmware load
+  borrows AppleHDA's first output stream descriptor. The wake path checks the
+  descriptor's RUN bit and defers while AppleHDA is streaming; the initial load
+  path does not yet, so loading over live playback hijacks the running stream
+  and produces immediate loud static, curable only by replugging the jack.
+  Install or update, then **reboot**.
 - Keep a recovery path for EFI edits (another OS that can mount the ESP, or a
   USB with a known-good EFI).
 - Don't run standalone capture test tools while the audio device is in use —

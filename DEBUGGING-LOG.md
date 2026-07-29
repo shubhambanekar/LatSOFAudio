@@ -16,6 +16,11 @@ Phase 14 came later and is a different kind of entry. Nothing was broken; a
 conclusion this project had already published was simply false. Finding that
 out took nine hours and came close to costing the speakers.
 
+Phase 15 is shorter than both, and it is a negative result: a reasonable idea,
+implemented correctly, refuted by the hardware. It is recorded so nobody spends
+another dead microphone and a revert cycle rediscovering it — and because the
+bug it set out to fix is still open.
+
 ---
 
 ## Phase 0 — Establish the hardware can do it at all
@@ -697,6 +702,89 @@ isolated is the one the system is testing.
   (`1.0.0b1`) would have made the kext silently unloadable — a symptom
   indistinguishable from the OpenCore failure that came next, which would have
   made both of them much harder to find at once.
+
+---
+
+## Phase 15 — The free stream that was not free
+
+Phase 13 retracted "the loader cannot be moved off SD7, the hardware cares which
+descriptor carries the code load" as a misdiagnosis: that attempt had moved the
+descriptor and left the stream tag at 1, the tag AppleHDA already drives SD7
+with. That retraction was correct about that attempt. It also left the door
+open, and this phase is the door closing — from the other side than expected.
+
+The idea was a good one. Borrowing SD7 means reprogramming a descriptor a live
+AppleHDA owns, and the entire snapshot-once/restore-once contract exists only to
+survive that. If the loader could run on a descriptor nobody owns, the most
+dangerous code in the driver would stop being dangerous. So patch 28 scanned the
+output descriptors for a genuinely free one — `RUN` clear, `CBL == 0`,
+`BDLPL == 0`, `BDLPU == 0` — and borrowed that instead of `SD(numISS)`, falling
+back to the old behaviour if nothing was free.
+
+The scan worked, first try (the property's trailing `ppctl` field elided):
+
+```
+"SD-Borrow" = "sd8 ctl=0x040000 fmt=0x0000 bdl=0x00000000 ppctl=…"
+```
+
+SD8, unprogrammed, AppleHDA's SD7 never touched. Exactly what the patch was
+written to produce.
+
+And the DSP did not boot:
+
+```
+"Status"          = "FAILED: FW load"
+"Wake-Retry-Done" = "GAVE UP after 12 tries"
+```
+
+Microphone dead. Treat the free-stream approach as a dead end: on this hardware
+the ROM code loader wants `SD(numISS)` — the first *output* descriptor — and the
+freedom of the descriptor bought nothing. Reverted to the committed build (md5
+`90563e1c`, UUID `24E00A16`); the failed source is kept **outside** the repo at
+`~/Desktop/latsof-attempt2/patch28-failed-attempt.cpp.bak` so the next person
+can read it instead of re-deriving it. Cost: a microphone outage and three
+reboots.
+
+One caveat, recorded because this log is only worth something if it does not
+flatter itself: patch 28 moved the descriptor and left `sTag` at 1 — the same
+pairing Phase 13 named when it retracted the earlier attempt. The tag was at
+least applied consistently, written into the new descriptor's `STRM` field and
+into the ROM purge message alike, so the two are not obviously in conflict. But
+descriptor index and stream tag were still not varied independently. Anyone
+revisiting this should vary the tag first, and should budget for the same
+microphone outage.
+
+**The bug that motivated the patch is still open.** It was never *which*
+descriptor gets borrowed — it is *when*. A `kmutil load -p` that takes effect on
+the running system, rather than staging for the next reboot, runs `start()` at
+whatever moment you typed the command, and `initDSP()` takes SD7 regardless of
+what is on it. Measured, with audio playing:
+
+```
+SD-Borrow: ctl=0x14001e     (RUN | IOCE | FEIE | DEIE — AppleHDA streaming)
+```
+
+followed by immediate loud static on the speakers, curable only by replugging
+the jack. The wake path already handles this case: `jackPoll`'s retry engine
+tests `rd8(hdaBase, outSd) & SD_CTL_RUN` and defers the rebuild while the
+descriptor is busy. The load path — `start()`'s call to `initDSP()`, line 471 of
+`LatSOFAudioDevice.cpp` in the committed build — has no such check. The correct
+fix is that same defer-and-retry preflight on the load path, keeping the SD7
+borrow. Until someone writes it, the rule is procedural: do not hot-load the
+kext while audio is playing. Reboot.
+
+**Lessons:**
+
+- An experiment can be executed perfectly and still be refuted. The scan was
+  right at the descriptor level; the firmware load is a different layer with its
+  own opinion, and a clean `SD-Borrow` line proves nothing about it.
+- Check that the fix you are attempting addresses the bug you actually have.
+  This one aimed at the borrow and the fault was in the timing of the borrow —
+  a guard on the load path, not a different descriptor.
+- Retracting a wrong conclusion (Phase 13) does not make its opposite true, and
+  one negative result does not finish the job either. "The loader cannot be
+  moved" now rests on a measurement rather than on bad reasoning — but only for
+  the single configuration that was tried.
 
 ---
 
