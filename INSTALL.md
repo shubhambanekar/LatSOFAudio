@@ -270,9 +270,14 @@ live switch will falsely tell you the sample rate wasn't the problem.
 **The fix:** Open **Audio MIDI Setup** (Applications → Utilities), select your
 output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 
-**Make it permanent** — macOS forgets this after preference wipes and NVRAM
-resets, so pin it at every login. From the top of your LatSOFAudio checkout
-(`cd ~/LatSOFAudio` or wherever you cloned it in step 1):
+**Make it permanent.** macOS does not remember this setting: it resets the
+rate whenever the output engine is rebuilt, which happens **every time you
+plug in or unplug the headphone jack** — so the machine can be clean all day
+and crackle the moment you reach for headphones. A one-shot at login is not
+enough; the tool below runs resident and re-pins on every change.
+
+From the top of your LatSOFAudio checkout (`cd ~/LatSOFAudio` or wherever you
+cloned it in step 1):
 
 ```sh
 clang -O2 -framework CoreAudio -framework CoreFoundation \
@@ -286,7 +291,7 @@ writes the file for you with your real home-directory path filled in (don't
 use TextEdit for this; it saves rich text and corrupts plists):
 
 ```sh
-mkdir -p ~/Library/LaunchAgents
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
 cat > ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -298,10 +303,17 @@ cat > ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist <<EOF
     <key>ProgramArguments</key>
     <array>
         <string>$HOME/Library/Application Support/LatSOF/latsof-setrate</string>
+        <string>--watch</string>
         <string>48000</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/latsof-setrate.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/latsof-setrate.log</string>
 </dict>
 </plist>
 EOF
@@ -314,10 +326,21 @@ The `plutil` line must print `OK`. Then load it:
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
 ```
 
-**No output means it worked.** Verify with
-`launchctl list | grep latsof` — an entry should appear. If you run the
-bootstrap command a second time you'll get `Bootstrap failed: 5: Input/output
-error` — that just means it's already loaded, not that anything is broken.
+**No output means it worked.** Verify:
+
+```sh
+launchctl list | grep latsof          # an entry with a PID should appear
+cat ~/Library/Logs/latsof-setrate.log # "watching ... pinning 48000 Hz"
+```
+
+If you run the bootstrap command a second time you'll get `Bootstrap failed:
+5: Input/output error` — that just means it's already loaded, not that
+anything is broken. (To reload after rebuilding the tool: `launchctl bootout
+gui/$(id -u)/com.hackintosh.latsof.setrate` first.)
+
+From now on that log is your evidence: every time the jack is plugged in you
+should see a line like `44100 -> 48000 (status 0)`, which is the fix doing its
+job.
 
 `CodecCommander.kext` is also worth having in your EFI for jack-related pops,
 but it does **not** fix this particular problem — the sample rate does.

@@ -163,8 +163,11 @@ only fully reprogrammed when the audio engine is rebuilt, so you must **sleep
 and wake the machine (or reboot)** before judging whether it worked. A live
 switch produces a false negative that cost this project an evening.
 
-To make it survive preference wipes and NVRAM resets, `contrib/latsof-setrate.c`
-pins the rate at login — full recipe in [`INSTALL.md`](INSTALL.md) §7.
+**And it comes back.** macOS resets the rate every time the output engine is
+rebuilt — most notably **whenever the headphone jack is plugged in or
+unplugged** — so a one-shot fix at login is lost exactly when you reach for
+headphones. `contrib/latsof-setrate.c` runs resident and re-pins on every
+device change; full recipe in [`INSTALL.md`](INSTALL.md) §7.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
 sample rate does.
 
