@@ -464,6 +464,60 @@ deadlines. Plug in the charger, or turn Low Power Mode off in System Settings
 headphones than through laptop speakers, which mask short glitches — so
 "headphones only" does not by itself mean the codec is at fault.)
 
+### Crackle during calls — the full-duplex rate mismatch
+
+There is a **third** fault, and it is the one that hits video-call apps. It has
+nothing to do with the codec or with CPU load, and it is worth knowing because
+the cure is instant.
+
+**This microphone is 48 kHz only.** The DSP pipeline runs at 48 kHz and the
+kernel engine publishes exactly that one rate — there is no 44.1 kHz to offer.
+Some apps nevertheless drag the *output* device to 44,100 Hz when a call
+starts: FaceTime does this reliably, on the reference machine, even for
+audio-only calls. CoreAudio is then bridging a 48 kHz input engine and a 44.1
+kHz output engine for every buffer — sample-rate conversion plus drift
+compensation — and its IO thread starts missing deadlines.
+
+Measured during a live FaceTime call on 29 July 2026: **746 overload events in
+60 seconds**, all of them logged by `avconferenced` (FaceTime's audio daemon)
+rather than the system at large, with the machine otherwise idle.
+
+Diagnose it in one line — note the process names, which is what distinguishes
+this from the CPU-load case above:
+
+```sh
+log show --last 2m --predicate 'subsystem == "com.apple.coreaudio"' \
+  --style compact | grep -i overload | awk '{print $4}' | sort | uniq -c
+```
+
+If the count is concentrated in one app's audio daemon (`avconferenced`,
+`Slack Helper`, a browser helper) while the machine is not busy, check the
+output rate — it will be 44,100.
+
+**The cure, safe to run mid-call:**
+
+```sh
+latsof-setrate 48000
+```
+
+The overloads stop immediately and the crackle goes with them; on the reference
+machine the count went from roughly six per second to zero within the same
+second. Note that this is the one situation where a live rate change *is* the
+fix rather than a false lead: nothing here depends on reprogramming the codec
+path, only on the two engines agreeing on a rate. The rate reverts to 48 kHz by
+itself when the call ends.
+
+A call that runs at 48 kHz on both sides never shows this at all — Slack calls
+on the same machine were clean throughout.
+
+**Do not mistake this for a performance problem.** It looks like one: the
+symptom is dropped audio, and the machine is a 4-core laptop. But after pinning
+48 kHz on the reference machine, the same FaceTime call was switched from
+audio-only to **full video** — adding hardware decode, the camera daemon and
+roughly 20% more CPU — and stayed perfectly clean. Rate agreement is what
+matters here; headroom is not. Chasing CPU usage in this situation wastes the
+afternoon (it did).
+
 ## 8. Siri
 
 Siri works with this driver as of the July 2026 kernel-audio release, on the
