@@ -218,6 +218,22 @@ the two microphone entries (step 8), or your firmware is not the IPC3
 `sof-cml` build (step 2), or your board isn't Comet Lake with
 SOF-attached DMICs (step 0 / `PORTING.md`).
 
+**Headphones (3.5mm) have static/crackle** — almost certainly the classic
+ALC 44.1 kHz problem, and it has a trap in it: switching the output to
+48,000 Hz in Audio MIDI Setup is **not sufficient on its own**. The codec
+path is only fully reprogrammed when the engine is rebuilt, so after
+changing the rate you must **sleep and wake the machine** (or reboot) for
+the fix to actually take — testing the new rate live will falsely tell
+you the rate wasn't the problem. It was; that false negative cost this
+project an evening. To make the fix survive preference wipes and NVRAM
+resets, build `contrib/latsof-setrate.c` and run it as a login
+LaunchAgent pinned to `48000`:
+
+```sh
+clang -O2 -framework CoreAudio -framework CoreFoundation \
+      -o latsof-setrate contrib/latsof-setrate.c
+```
+
 **Speakers or playback misbehave after experimenting with the source** —
 read "The interrupt-starvation bug" in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) before changing anything about
