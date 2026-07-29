@@ -408,6 +408,21 @@ the whole point of snapshot-once/restore-once — but the forgiving cold-boot
 state described under "Why this is easy to get wrong" is no longer guaranteed to
 be what you are exercising.
 
+**A gap on that path, still open.** That ordering is benign only while
+AppleHDA is idle. Loading late also means this kext can be loaded while
+AppleHDA is actively *playing*, and `initDSP()` does not check for that before
+it takes SD7. Measured with audio running, `SD-Borrow` read `ctl=0x14001e` —
+`RUN | IOCE | FEIE | DEIE`, i.e. AppleHDA mid-stream — and the speakers
+produced immediate loud static, curable only by replugging the jack.
+Snapshot/restore cannot help here: it faithfully hands back a descriptor whose
+playback was already destroyed in flight. The wake path already guards against
+exactly this — `jackPoll` tests `rd8(hdaBase, outSd) & SD_CTL_RUN` and defers
+the rebuild while the descriptor is busy — but the `start()` path that calls
+`initDSP()` at boot has no equivalent preflight. The correct fix is that same
+defer-and-retry check on the load path, keeping the SD7 borrow. Until it
+exists: **do not `kmutil load -p` this kext while audio is playing — reboot
+instead.**
+
 ## The HAL plugin, historically
 
 `plugin/LatSOFAudioPlugin.driver` remains in the tree and is **no longer
@@ -499,7 +514,57 @@ boot, and the reason is worth recording because it was initially misread as
 the **stream tag** at 1 — and AppleHDA drives SD7 with tag 1 as well. The ROM
 binds its code-load gateway by *tag*, not by descriptor index, so that put two
 output descriptors on one tag. Relocating the loader may well be viable, but
-only if the tag moves with it.
+only if the tag moves with it — and that is still untested, because the one
+attempt since then did not move the tag either.
+
+Patch 28 (29 Jul 2026) scanned the output descriptors for a genuinely free one
+— `RUN` clear, `CBL`, `BDLPL` and `BDLPU` all zero — and used it instead of
+`SD(numISS)`. The scan worked on the first try; `ioreg` reported
+
+```
+"SD-Borrow" = "sd8 ctl=0x040000 fmt=0x0000 bdl=0x00000000"
+```
+
+an unprogrammed descriptor, with AppleHDA's SD7 left entirely alone. The
+firmware still would not boot over it:
+
+```
+"Status"          = "FAILED: FW load"
+"Wake-Retry-Done" = "GAVE UP after 12 tries"
+```
+
+and the mic was dead until the previous build was reinstalled.
+
+Read that result carefully, because it is easy to over-read. **Patch 28 moved
+the descriptor index and left `sTag` at 1**, exactly as the first attempt did,
+and the ROM is told which stream to receive on by *tag*:
+
+```c
+wr32(dsp, IPC_HIPCIDR, IPC_BUSY | ROM_IPC_CONTROL | ROM_IPC_PURGE_FW | ((sTag - 1) << 9));
+```
+
+SD8 on tag 1 while AppleHDA still drives SD7 on tag 1 is the same collision as
+before, so the failure is already explained by the tag and says nothing new
+about the index. What *is* measured is narrower than "the hardware demands
+SD7": **a free descriptor is not the missing piece.** Finding one buys nothing
+on its own.
+
+So if you try a third time, move the tag with the descriptor or do not bother.
+Repeating the free-stream scan alone costs a dead mic and settles nothing. The
+failed source is kept outside the repo as
+`~/Desktop/latsof-attempt2/patch28-failed-attempt.cpp.bak`.
+
+**What patch 28 was trying to fix is still open.** Hot-loading the kext while
+AppleHDA is playing hijacks a running stream: `SD-Borrow` read `ctl=0x14001e`
+(`RUN|IOCE|FEIE|DEIE` — AppleHDA mid-stream) and the speakers went to loud
+static that only a jack replug cleared. The snapshot/restore contract cannot
+help there; it restores registers, not a running FIFO, and AppleHDA never
+re-programs what it believes it still owns. The wake path already defers while
+the descriptor is busy — `jackPoll` checks `rd8(hdaBase, outSd) & SD_CTL_RUN` —
+but the `start()` path that calls `initDSP()` at `LatSOFAudioDevice.cpp:471` has
+no such check. The right fix is that same preflight on the load path, keeping
+the SD7 borrow. Until it exists: do not hot-load this kext while audio is
+playing. Reboot instead.
 
 Given the loan is unavoidable, the contract is:
 

@@ -27,7 +27,7 @@ with nothing plugged in.
 6. [Why not the EFI?](#6-why-not-the-efi)
 7. [Fix headphone crackle](#7-fix-headphone-crackle-optional-but-recommended)
 8. [Turn on Siri](#8-siri)
-9. [Uninstalling / rolling back](#9-uninstalling)
+9. [Updating, rolling back, uninstalling](#9-updating-rolling-back-uninstalling)
 10. [Troubleshooting](#10-troubleshooting)
 
 ## 0. What you need
@@ -126,7 +126,11 @@ path from step 2.
 ## 4. Install the kext
 
 This copies the kext where macOS itself can load it, sets the ownership macOS
-requires, and asks the system to link it.
+requires, and asks the system to link it. **All four commands matter, in this
+order.** The `chown` is not cosmetic: `ditto` reproduces the source bundle's
+ownership, so even under `sudo` the copy arrives owned by your account
+(`yourname:staff`) — and `kmutil` refuses to load a kext in
+`/Library/Extensions` that isn't `root:wheel`.
 
 Run this from the `kext/` directory where `make` left `LatSOFAudio.kext` — if
 you opened a new terminal since step 3, `cd` back first (e.g.
@@ -162,9 +166,37 @@ You should see `com.hackintosh.LatSOFAudio` listed with
 > `kmutil load -p` is the right command; it only touches the auxiliary
 > collection, which is where third-party kexts belong.
 
-If macOS shows a **"System Extension Blocked"** notification, open System
-Settings → Privacy & Security, scroll to the bottom, click **Allow**, and run
-the `kmutil load -p` command again.
+**The other thing `kmutil` may answer is `Code=27` — the approval gate:**
+
+```
+Error Domain=KMErrorDomain Code=27 "Extension with identifiers
+com.hackintosh.LatSOFAudio not approved to load. Please approve using
+System Settings."
+```
+
+Nothing is wrong with the kext; macOS is asking for your consent and will not
+stage it until you give it. Do this:
+
+1. Open **System Settings → Privacy & Security**.
+2. **Scroll to the very bottom of that pane.** The approval row sits below
+   everything else and is easy to miss. (Some builds also post a *"System
+   Extension Blocked"* notification — same control, same place.)
+3. Click **Allow** and enter your password.
+4. Run the **same** `kmutil load -p` command again. It should now answer with
+   the `Code=28` "requires a reboot" message above.
+
+> **This prompt comes back every time the kext binary changes.** It is not a
+> one-off for first installs: rebuild the kext, reinstall it, and macOS sees a
+> new identity (a new UUID) and asks again. Expect to approve-and-re-run every
+> time you replace the kext, not just on the first install.
+>
+> The reason is the SIP value from step 0. `0x803` sets the
+> allow-unsigned-kexts bit (`0x1`) but **not** the skip-approval bit (`0x200`),
+> so each new binary needs a human. If you rebuild often you can set
+> `csr-active-config` to `030A0000` (that is `0xA03` = `0x803 | 0x200`) the same
+> way as in step 0 — a **Data** entry, plus the `NVRAM → Delete` line — and the
+> prompt stops for good, at the cost of one more SIP bit lowered. Optional, and
+> only worth it on a machine you are developing on.
 
 Now reboot.
 
@@ -292,6 +324,70 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 > pin, it must wait until the device has been quiet for several seconds and
 > only then correct a rate that is genuinely stuck — the naive version
 > actively breaks audio.
+### The `latsof-setrate` helper — install it once
+
+The rest of this section uses a small command-line tool that reports and pins
+the analog output's sample rate. It is under 200 lines of CoreAudio: no
+firmware, no kext, no background process. Build it and put it on your `PATH`
+once — every later mention in this document is the bare command name.
+
+```sh
+cd /path/to/LatSOFAudio                       # the repo you cloned in step 1
+clang -O2 -framework CoreAudio -framework CoreFoundation \
+      -o latsof-setrate contrib/latsof-setrate.c
+sudo install -d -m 755 /usr/local/bin
+sudo install -m 755 latsof-setrate /usr/local/bin/
+rm latsof-setrate                             # keep only the installed copy
+```
+
+That last `rm` is not housekeeping. `.gitignore` here covers `*.o`, `*.kext/`
+and `build/`, but not a bare `latsof-setrate` binary sitting at the repo root
+— leave it there and you will eventually commit a Mach-O by accident.
+
+`/usr/local/bin` is first on the default `PATH`, is not SIP-protected, and
+survives macOS updates — so the tool is still there on the day you need it,
+which may be months from now and long after this checkout has moved or been
+deleted. That is the whole reason it goes there rather than being run out of
+the repo. Note what this does **not** install: no LaunchAgent, no login item,
+nothing that runs on its own.
+
+Two forms, both one-shot:
+
+```sh
+latsof-setrate                 # report the current rate
+latsof-setrate 48000           # pin to 48 kHz
+```
+
+The report form prints one line per analog output engine (the UID suffix is
+machine-specific — yours will differ):
+
+```
+AppleHDAEngineOutput:1F,3,0,1,0:0  current=48000
+```
+
+`current=48000` is the healthy reading; `current=44100` is the fault this
+section is about. The pin form prints a timestamped line when it changes
+something —
+
+```
+14:22:07 AppleHDAEngineOutput:1F,3,0,1,0:0  44100 -> 48000 (status 0)
+```
+
+— and **prints nothing at all when the rate is already correct**: silence
+means it had no work to do, not that it failed.
+
+> **The tool also has a `--watch` mode. Never run it.** `latsof-setrate
+> --watch 48000` *is* the resident agent retracted above — it stays running
+> and re-pins on every device change, including the 44.1 kHz transient that a
+> jack plug legitimately passes through, which is precisely how it produced
+> static on both outputs. It is kept in the source only so the negative result
+> stays reproducible. Not from a LaunchAgent, not from a login item, not in a
+> terminal tab you leave open.
+>
+> Be warned that the comment block at the top of `contrib/latsof-setrate.c`
+> still recommends running `--watch` from a LaunchAgent with `KeepAlive`.
+> That comment predates the retraction and is wrong; this document overrides
+> it.
 
 ### The cold-boot case, and its 20-second cure
 
@@ -306,7 +402,7 @@ not reliably apply it during a cold boot with the jack occupied.
 The cure, without sleeping the machine — **order matters**:
 
 ```sh
-"$HOME/Library/Application Support/LatSOF/latsof-setrate" 48000   # 1. pin
+latsof-setrate 48000                                              # 1. pin
 # 2. unplug and replug the headphones
 # 3. play something — clean
 ```
@@ -321,18 +417,14 @@ probably never meet this at all.
 idle, not during a plug), the same two steps apply — pin, then rebuild:
 
 ```sh
-clang -O2 -framework CoreAudio -framework CoreFoundation \
-      -o latsof-setrate contrib/latsof-setrate.c   # from the repo root
-./latsof-setrate                 # report the current rate
-./latsof-setrate 48000           # pin it once
+latsof-setrate                   # report the current rate
+latsof-setrate 48000             # pin it once
 ```
 
 Then sleep/wake or replug the jack so the codec path is reprogrammed at the
-new rate. That is the whole fix; no background process required.
-
-From now on that log is your evidence: every time the jack is plugged in you
-should see a line like `44100 -> 48000 (status 0)`, which is the fix doing its
-job.
+new rate. That is the whole fix; no background process required. (If the shell
+answers `command not found`, you have not built and installed the helper yet —
+see "The `latsof-setrate` helper" above.)
 
 `CodecCommander.kext` is also worth having in your EFI for jack-related pops,
 but it does **not** fix this particular problem — the sample rate does.
@@ -448,7 +540,101 @@ microphone"). USB devices skip that check entirely — which is why a USB mic
 always worked. The kext publishes the `'imic'` selector so the internal mics
 qualify. Details in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-## 9. Uninstalling
+## 9. Updating, rolling back, uninstalling
+
+### Updating to a new build
+
+Never copy a new kext *over* the installed one. Remove it, copy, then **prove**
+you actually got the new binary. Run this from the `kext/` directory `make`
+wrote to, as in step 4:
+
+```sh
+sudo rm -rf /Library/Extensions/LatSOFAudio.kext
+sudo ditto LatSOFAudio.kext /Library/Extensions/LatSOFAudio.kext
+md5 -q /Library/Extensions/LatSOFAudio.kext/Contents/MacOS/LatSOFAudio
+md5 -q LatSOFAudio.kext/Contents/MacOS/LatSOFAudio          # must match
+sudo chown -R root:wheel /Library/Extensions/LatSOFAudio.kext
+sudo chmod -R 755 /Library/Extensions/LatSOFAudio.kext
+sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
+```
+
+**The two `md5` lines are not paranoia.** On the reference machine on 29 July
+2026 the `ditto` printed no error and the *old* binary was still sitting in
+`/Library/Extensions` — every later check looked fine and the fix under test
+simply wasn't there. The hash is what caught it. If the two hashes differ, the
+copy did not happen: confirm the old bundle was really removed, and that you
+are copying from the directory `make` just wrote to and not an older tree.
+
+**Expect the approval prompt again.** A new binary is a new identity to macOS,
+so `kmutil load -p` will usually answer this rather than the `Code=28` from
+step 4:
+
+```
+Error Domain=KMErrorDomain Code=27 "Extension with identifiers
+com.hackintosh.LatSOFAudio not approved to load. Please approve using
+System Settings."
+```
+
+Open System Settings → Privacy & Security, scroll to the **bottom**, click
+**Allow**, enter your password, then re-run the same `kmutil load -p` command
+— it should then give the `Code=28` "requires a reboot" message. This happens
+on every install *and every rebuild*, because the `csr-active-config` value
+from step 0 (`0x803`) allows unsigned kexts but does not include the
+skip-approval bit. If you rebuild often and would rather never see the prompt,
+`0xA03` — `030a0000` in `config.plist` — adds that bit, at the cost of one more
+lowered SIP bit.
+
+**Don't do this while audio is playing.** The driver borrows AppleHDA's first
+output stream while it starts up; if AppleHDA is streaming at that moment the
+load hijacks the running stream and you get immediate loud static from the
+speakers, curable only by physically replugging the jack. Stop playback first —
+or skip the live load entirely and just reboot.
+
+**Then reboot.** `kmutil showloaded` reports the kext that is *running*, which
+is still the old one until you restart — a new hash on disk together with the
+old build in `showloaded` is normal *before* the reboot and a bug *after* it.
+Check both.
+
+**After the reboot, verify — step 5's three checks, in the same order:**
+
+```sh
+kmutil showloaded | grep -i latsof
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "Status|SD-Borrow|SD-Final"
+system_profiler SPAudioDataType | grep -A8 "LatSOF DMIC"
+```
+
+In order, you want: `com.hackintosh.LatSOFAudio (1.1.5)` followed by a UUID —
+and if you noted the old build's UUID before updating, this one must be
+*different*, which is your proof the running kext is the new one; then
+`"Status" = "OK"`, with `SD-Borrow` and `SD-Final` naming the same stream and
+agreeing field-for-field (`sd7` on the reference laptop — the number varies by
+machine, and step 5 explains the comparison); then a `LatSOF DMIC capture`
+block reading `Default Input Device: Yes`, `Input Channels: 2`,
+`Current SampleRate: 48000`, `Transport: Built-in` and
+`Input Source: Internal Microphone`. Step 5 shows all three in full.
+
+If `Status` reads `FAILED: FW load` instead, the new build did not bring the
+DSP up and the microphone is dead — roll back, then see Troubleshooting.
+
+### Rolling back
+
+There is no separate rollback procedure: **keep the previous `LatSOFAudio.kext`
+bundle** and reinstall it with exactly the update steps above. Copy it out
+before you overwrite it — the build directory is not a backup, since the next
+`make` relinks the binary in place and `make clean` deletes the bundle
+outright:
+
+```sh
+sudo ditto /Library/Extensions/LatSOFAudio.kext ~/LatSOFAudio-known-good.kext
+```
+
+Then roll back by running the update block with `~/LatSOFAudio-known-good.kext`
+as the `ditto` source. The `md5` check matters *more* here, not less: two
+builds of this kext are indistinguishable from the outside, so the hash is the
+only thing that tells you which one you are running. If the approval prompt
+reappears, approve and re-run as above; either way, reboot and verify.
+
+### Uninstalling
 
 **Remove the kext:**
 
@@ -504,6 +690,43 @@ firmware didn't load — wrong firmware generation (step 2) or wrong hardware
 ```sh
 ioreg -rc LatSOFKernelAudioEngine -w0 | grep IOAudioEngineState
 ```
+**`"Status" = "FAILED: FW load"`** — the DSP firmware did not load, and the
+microphone is dead however healthy everything else looks: the kext is loaded
+and there is nothing behind it. This is the specific case of the generic
+"firmware didn't load" above, and it carries one extra diagnostic:
+
+```sh
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "Status|Wake-Retry"
+```
+
+If the mic died across a sleep/wake rather than at boot, you will also see
+`"Wake-Retry-Done" = "GAVE UP after 12 tries"`: the driver re-attempted the
+bring-up twelve times and the DSP never answered. If that command prints
+*nothing at all* while `kmutil showloaded` still lists the kext, the failure
+happened during `start()` and macOS detached the device — the reason is only
+in the log then:
+
+```sh
+log show --last 10m --predicate 'process == "kernel"' --style compact \
+  | grep -i "latsof.*FAILED"
+```
+
+Causes, in order of likelihood: wrong firmware generation — it must be IPC3,
+the v2.2.x `sof-cml.ri`, not IPC4 (step 2); a truncated file or a copied
+symlink (step 2's 500–600 KB check); the board's mics aren't on the DSP at all
+(step 0 / [`PORTING.md`](PORTING.md)); or, if you have modified the source, a
+change to *which* stream descriptor the code loader borrows. Keep it on
+`SD(numISS)`, AppleHDA's first output stream (`sd7` on the reference laptop) —
+scanning for a genuinely free descriptor instead has been tried, and it
+produces exactly this failure: the borrow looks perfect in ioreg and the
+firmware still refuses to load. See "The borrowed-stream contract" in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) before touching `initDSP()`.
+
+If this appeared right after installing a new build, put the previous `.kext`
+bundle back: `sudo rm -rf /Library/Extensions/LatSOFAudio.kext` first, then
+step 4 verbatim — `ditto` onto an existing bundle can silently leave the old
+binary in place. That separates a bad build from bad hardware in one reboot.
+
 
 **Two "internal microphone" entries / level meter dead** — you selected the
 device literally named "Internal Microphone", which is AppleHDA's codec path

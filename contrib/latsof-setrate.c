@@ -2,22 +2,32 @@
 // latsof-setrate — pin the AppleHDA analog output to a fixed sample rate.
 //
 // WHY: on ALC laptops the analog output crackles/hisses at 44.1 kHz; 48 kHz
-// is clean. Setting the rate cures it, but macOS resets the rate whenever the
-// output engine is rebuilt — which happens every time the headphone jack is
-// plugged in or pulled out, and on some wake paths. A one-shot at login
-// therefore loses the fix exactly when you reach for headphones: the machine
-// was pinned at 48 kHz all day, you plug in, the engine comes back at 44.1
-// kHz, and the static is there again.
+// is clean. macOS re-derives the rate whenever the output engine is rebuilt —
+// every headphone plug or unplug, and some wake paths — and on the reference
+// machine it settles back on 48 kHz by itself. Two cases do not: a cold boot
+// with the jack already occupied, and an engine left genuinely stuck at 44.1.
+// This tool exists for those two cases: run it by hand, once, then rebuild the
+// engine (replug the jack, or sleep/wake). Nothing here belongs in a startup
+// item.
 //
 // Usage:
 //   latsof-setrate                  report the current rate and exit
 //   latsof-setrate 48000            pin once and exit
-//   latsof-setrate --watch 48000    stay resident, re-pin on every change
+//   latsof-setrate --watch <rate>   RETRACTED — see the warning below
 //
-// --watch is the mode you want in a LaunchAgent (with KeepAlive). It listens
-// for device-list, default-output and data-source changes, re-pins on each,
-// and repeats the pin a moment later because a freshly rebuilt engine can
-// take the rate and then revert it during initialisation.
+// The one-shot pin is quiet unless it changes something: on a change it prints
+// one timestamped line — the device UID, then "44100 -> 48000 (status 0)" —
+// and if the rate is already right it prints nothing. Either way it exits 0.
+// "--watch" is only recognised as the first argument; anywhere else it is
+// silently ignored and the tool behaves as a one-shot.
+//
+// DO NOT RUN --watch RESIDENT. It was written for a LaunchAgent (KeepAlive)
+// and that experiment failed on the reference machine, 29 Jul 2026: a jack
+// plug makes AppleHDA pass through 44.1 kHz while it reprograms the codec, the
+// watcher writes 48 kHz into the middle of that, and stream and codec end up
+// disagreeing — harsh static on headphones AND speakers, curable only by
+// physically replugging (a coreaudiod restart does not clear it). The mode is
+// kept only so the negative result stays reproducible. See INSTALL.md §7.
 //
 // Note: a live rate change is not by itself a valid test of the crackle fix —
 // the codec path is only fully reprogrammed when the engine is rebuilt, so
@@ -26,9 +36,16 @@
 // Part of LatSOFAudio: https://github.com/shubhambanekar/LatSOFAudio
 // Copyright (c) 2026 Shubham Banekar — BSD-3-Clause.
 //
-// Build:
+// Build and install (from the repo root):
 //   clang -O2 -framework CoreAudio -framework CoreFoundation \
-//         -o latsof-setrate latsof-setrate.c
+//         -o latsof-setrate contrib/latsof-setrate.c
+//   sudo install -d -m 755 /usr/local/bin
+//   sudo install -m 755 latsof-setrate /usr/local/bin/
+//   rm latsof-setrate          # not covered by .gitignore — do not commit it
+//
+// /usr/local/bin is on the default PATH and is not SIP-protected, so the
+// commands under "Usage" above work from any shell and survive macOS updates.
+// No LaunchAgent, and nothing to keep running.
 //
 
 #include <CoreAudio/CoreAudio.h>
