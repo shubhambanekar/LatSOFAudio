@@ -293,8 +293,32 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 > only then correct a rate that is genuinely stuck — the naive version
 > actively breaks audio.
 
+### The cold-boot case, and its 20-second cure
+
+Measured on the reference machine: if you **boot with headphones already
+plugged in**, the output engine can come up at 44,100 Hz and *stay* there.
+Replugging alone does not help — each replug rebuilds at 44.1 again — so the
+static appears permanent until the machine is slept and woken, which is when
+it lands on 48,000 Hz and goes clean. macOS stores 48,000 in
+`/Library/Preferences/Audio/com.apple.audio.DeviceSettings.plist`, but does
+not reliably apply it during a cold boot with the jack occupied.
+
+The cure, without sleeping the machine — **order matters**:
+
+```sh
+"$HOME/Library/Application Support/LatSOF/latsof-setrate" 48000   # 1. pin
+# 2. unplug and replug the headphones
+# 3. play something — clean
+```
+
+Step 1 alone does nothing audible (a live rate switch never reprograms the
+codec path). Step 2 is what rebuilds the engine, and because the rate is
+already pinned, it rebuilds *at* 48 kHz. Sleep/wake achieves the same thing;
+this is just faster. If you rarely boot with headphones connected, you will
+probably never meet this at all.
+
 **If you ever find the output genuinely stuck at 44,100 Hz** (checked while
-idle, not during a plug), set it once and then rebuild the engine properly:
+idle, not during a plug), the same two steps apply — pin, then rebuild:
 
 ```sh
 clang -O2 -framework CoreAudio -framework CoreFoundation \
