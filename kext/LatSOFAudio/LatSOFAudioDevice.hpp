@@ -60,6 +60,7 @@ enum {
 #define kLatSOF_CapBufferSize   (kLatSOF_BufferFrames * kLatSOF_CapBytesPerFrame)
 
 class LatSOFAudioUserClient;
+class LatSOFKernelAudioDevice;
 
 class LatSOFAudioDevice : public IOService {
     OSDeclareDefaultStructors(LatSOFAudioDevice)
@@ -86,6 +87,17 @@ public:
     IOReturn stopCapture();
     UInt32   getCapturePosition();
     IOBufferMemoryDescriptor *getCaptureBuffer() { return capDmaBuf; }
+
+    // kernel-mic: entry points for LatSOFKernelAudioEngine. Routed through
+    // the commandGate rather than calling the gated forms directly: both
+    // audio classes override getWorkLoop to return ours, so family
+    // callbacks SHOULD arrive on this workloop already — but IOAudioFamily
+    // internally caches its own workLoop member, and whether every
+    // callback path honors the virtual accessor is exactly the kind of
+    // claim that needs no trusting when runAction is correct from any
+    // thread at recursion-safe cost.
+    IOReturn engineStartCapture();
+    void     engineStopCapture();
 
 private:
     IOPCIDevice *pciDevice;
@@ -159,6 +171,7 @@ private:
     static IOReturn s_startCapture (OSObject *o, void *, void *, void *, void *);
     static IOReturn s_stopCapture  (OSObject *o, void *, void *, void *, void *);
     static IOReturn s_handleWillSleep(OSObject *o, void *, void *, void *, void *);
+    static IOReturn s_engineStartCapture(OSObject *o, void *, void *, void *, void *);
     static IOReturn s_handleClamshellChange(OSObject *o, void *closed, void *, void *, void *);
 
     // Hardware init (called from start() and setPowerState on wake)
@@ -192,6 +205,11 @@ private:
     // Capture shared DMA buffer
     IOBufferMemoryDescriptor *capDmaBuf;
     IOBufferMemoryDescriptor *capBdlBuf;
+
+    // kernel-mic: the IOAudioFamily face of this driver. Created in start()
+    // after initDSP succeeds; publishes the capture ring as a kernel audio
+    // device so Siri's kernel-only device selector can see the microphone.
+    LatSOFKernelAudioDevice *kernelAudio;
 
     // Coordination flag page shared with the plugin (see kLatSOF_MemFlags).
     // The plugin maps this read-only-ish page via IOConnectMapMemory64 and

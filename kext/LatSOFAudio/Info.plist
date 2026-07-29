@@ -42,6 +42,8 @@
 	<string>1.1.5</string>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<key>com.apple.iokit.IOAudioFamily</key>
+		<string>200.5</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>2.9</string>
 		<key>com.apple.kpi.bsd</key>

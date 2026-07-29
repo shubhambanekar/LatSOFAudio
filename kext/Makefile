@@ -55,7 +55,7 @@ LDFLAGS = \
 
 # Source files
 SRCDIR = $(KEXT_NAME)
-SRCS = $(SRCDIR)/LatSOFAudioDevice.cpp
+SRCS = $(SRCDIR)/LatSOFAudioDevice.cpp $(SRCDIR)/LatSOFKernelAudio.cpp
 OBJS = $(SRCS:.cpp=.o) $(SRCDIR)/sof_firmware_embed.o
 
 # Build targets

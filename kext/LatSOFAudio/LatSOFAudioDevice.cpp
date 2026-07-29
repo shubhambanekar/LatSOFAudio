@@ -10,6 +10,7 @@
 //
 
 #include "LatSOFAudioDevice.hpp"
+#include "LatSOFKernelAudio.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -391,6 +392,7 @@ bool LatSOFAudioDevice::init(OSDictionary *d) {
     hwReady = false; isPlaying = false; isCapturing = false;
     lastJackState = false; jackTimer = nullptr;
     commandGate = nullptr; rootDomain = nullptr; powerNotifier = nullptr;
+    kernelAudio = nullptr;
     sharedDmaBuf = nullptr; sharedBdlBuf = nullptr;
     capDmaBuf = nullptr; capBdlBuf = nullptr;
     flagsBuf = nullptr;
@@ -514,6 +516,29 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     if (flagsBuf) {
         flagsBuf->prepare();
         bzero(flagsBuf->getBytesNoCopy(), PAGE_SIZE);
+    }
+
+    // kernel-mic: publish the capture ring as a kernel audio device.
+    // Non-fatal on failure — capture still works through the UserClient —
+    // but log loudly, because Siri visibility is the entire point.
+    kernelAudio = new LatSOFKernelAudioDevice;
+    if (kernelAudio) {
+        kernelAudio->setOwner(this);
+        if (!kernelAudio->init(nullptr)) {
+            kernelAudio->release(); kernelAudio = nullptr;
+        } else if (!kernelAudio->attach(this)) {
+            kernelAudio->release(); kernelAudio = nullptr;
+        } else if (!kernelAudio->start(this)) {
+            // attach succeeded: detach too, or the dead child stays
+            // visible in the IORegistry forever (review minor).
+            kernelAudio->detach(this);
+            kernelAudio->release(); kernelAudio = nullptr;
+        }
+        if (!kernelAudio) {
+            IOLog("LatSOF: kernel audio device FAILED to publish\n");
+        } else {
+            IOLog("LatSOF: kernel audio device published\n");
+        }
     }
 
     IOLog("LatSOF: start() completed, hwReady=%d\n", hwReady ? 1 : 0);
@@ -1742,6 +1767,15 @@ void LatSOFAudioDevice::stop(IOService *provider) {
         if (getWorkLoop()) getWorkLoop()->removeEventSource(jackTimer);
         jackTimer->release(); jackTimer = nullptr;
     }
+    // kernel-mic: tear the audio device down first, while the workloop and
+    // gated capture paths are fully alive — its engine stop calls
+    // engineStopCapture, which must find working machinery.
+    if (kernelAudio) {
+        kernelAudio->terminate(kIOServiceSynchronous);
+        kernelAudio->release();
+        kernelAudio = nullptr;
+    }
+
     // patch-26: stop our streams BEFORE PMstop. PMstop synchronously
     // delivers setPowerState(0) → shutdownForSleepGated, which clears
     // isPlaying/isCapturing without stopping DMA — correct for sleep,
@@ -2395,6 +2429,38 @@ IOReturn LatSOFAudioDevice::stopPlayback() {
 IOReturn LatSOFAudioDevice::startCapture() {
     if (!commandGate) return kIOReturnNotReady;
     return commandGate->runAction(&s_startCapture);
+}
+
+// kernel-mic: engine entry points. IOCommandGate::runAction is re-entrant
+// safe when already on the gated context (it detects and calls through),
+// and it is LOAD-BEARING here, not paranoia: review traced IOAudioFamily
+// 600.2 running device PM on a private workloop, so family callbacks are
+// not reliably on ours despite the getWorkLoop overrides.
+// The demand latch is a HAL-plugin-era mechanism: that client could never
+// re-ask, so a refused start had to be remembered and re-armed by jackPoll.
+// The family world is the opposite — coreaudiod re-calls
+// performAudioEngineStart on client activity by design — and a latched
+// re-arm here would start capture DMA with NO running engine attached,
+// which nothing would ever stop (review-verified against family sources:
+// performAudioEngineStop is only sent to a Running engine). So an
+// engine-originated refusal must not leave the latch armed — and the
+// refusal and the un-latch MUST be one atomic gated action: round 2 proved
+// that as two runActions, jackPoll's tick can win the gate in the gap,
+// consume the latch, and start the exact headless DMA this exists to
+// prevent, self-re-arming across every later sleep.
+IOReturn LatSOFAudioDevice::s_engineStartCapture(OSObject *o, void *, void *, void *, void *) {
+    auto *self = static_cast<LatSOFAudioDevice *>(o);
+    IOReturn r = self->startCaptureGated();
+    if (r != kIOReturnSuccess)
+        gWasCapturing = false;   // same gate closure: nothing can interleave
+    return r;
+}
+IOReturn LatSOFAudioDevice::engineStartCapture() {
+    if (!commandGate) return kIOReturnNotReady;
+    return commandGate->runAction(&s_engineStartCapture);
+}
+void LatSOFAudioDevice::engineStopCapture() {
+    if (commandGate) commandGate->runAction(&s_stopCapture);
 }
 IOReturn LatSOFAudioDevice::stopCapture() {
     if (!commandGate) return kIOReturnNotReady;
