@@ -324,6 +324,11 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 > pin, it must wait until the device has been quiet for several seconds and
 > only then correct a rate that is genuinely stuck — the naive version
 > actively breaks audio.
+>
+> **That safe version now exists** — `latsof-setrate --enforce 48000`, described
+> at the end of this section. It is built around exactly the rule above: it
+> reacts to *quiet*, never to change. Do not replace it with something that
+> writes the rate from a notification callback, which is what failed here.
 ### The `latsof-setrate` helper — install it once
 
 The rest of this section uses a small command-line tool that reports and pins
@@ -509,6 +514,72 @@ itself when the call ends.
 
 A call that runs at 48 kHz on both sides never shows this at all — Slack calls
 on the same machine were clean throughout.
+
+### Enforcing 48 kHz automatically
+
+Running the command by hand every time a call app pulls the rate down gets old.
+`--enforce` does it for you, and it is safe *because of how it is shaped*:
+
+```sh
+latsof-setrate --enforce 48000
+```
+
+It **reacts to quiet, never to change.** Device notifications only restart an
+eight-second timer; the rate is corrected solely once it has been wrong
+continuously for that long with nothing else happening. That separates the two
+cases exactly:
+
+| Situation | 44.1 kHz lasts | Enforcer |
+|---|---|---|
+| Headphone jack plugged in | under a second, settles by itself | never fires |
+| Call app holding the output down | the whole call | corrects once |
+
+The first row is the important one: writing the rate during a jack rebuild is
+what produced the harsh static described in the box above, so the enforcer is
+built specifically not to be there. Both behaviours were verified before this
+was documented — a transient flip produced zero corrections, a persistent one
+produced exactly one. There is also a runaway guard: if something keeps
+resetting the rate, it backs off to one attempt a minute and says so, rather
+than fighting in a loop.
+
+To run it at login, install it as a LaunchAgent. Paste the whole block:
+
+```sh
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
+cat > ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.hackintosh.latsof.setrate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/latsof-setrate</string>
+        <string>--enforce</string>
+        <string>48000</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$HOME/Library/Logs/latsof-setrate.log</string>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/latsof-setrate.log</string>
+</dict>
+</plist>
+EOF
+plutil -lint ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
+```
+
+`plutil` must print `OK`, and `bootstrap` prints nothing when it works. Check it
+with `launchctl list | grep latsof` (an entry with a PID) and
+`cat ~/Library/Logs/latsof-setrate.log`, which should open with
+`enforcing 48000 Hz`. Every later line in that log is a correction it made —
+useful evidence, and it should be a short file. To remove it:
+
+```sh
+launchctl bootout gui/$(id -u)/com.hackintosh.latsof.setrate
+rm ~/Library/LaunchAgents/com.hackintosh.latsof.setrate.plist
+```
 
 **Do not mistake this for a performance problem.** It looks like one: the
 symptom is dropped audio, and the machine is a 4-core laptop. But after pinning

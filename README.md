@@ -215,20 +215,24 @@ can come up at 44.1 kHz and *stay* there — replugging alone just rebuilds at
 44.1 again. The order is the whole trick: pin 48 kHz *first*, replug *after*.
 Full procedure in [`INSTALL.md`](INSTALL.md) §7.
 
-**Do not automate the pin with a resident agent.** Plugging the jack makes
+**Automating the pin is possible, but only one way.** Plugging the jack makes
 AppleHDA rebuild the engine, and it passes *through* 44.1 kHz before settling
 at 48 kHz by itself. A watcher that "corrects" that transient writes the rate
 while the codec is still being programmed, leaving stream and codec
 disagreeing — harsh static on headphones **and** speakers, curable only by
-physically replugging. This was measured here, the hard way: the automation
-caused a worse fault than the one it fixed. Concretely: the helper in
-`contrib/latsof-setrate.c` still carries a `--watch` mode, and that mode *is*
-the retracted agent — never run it, and never wrap it in a LaunchAgent,
-whatever that file's header comment still suggests. The supported use is the
-one-shot `latsof-setrate 48000` (installed to `/usr/local/bin`), followed by a
-replug or a sleep/wake — pinning the rate alone never reprograms the codec
-path. How to build and install it, and the rest of the detail, live in
-[`INSTALL.md`](INSTALL.md) §7.
+physically replugging. That was measured here, the hard way: the first
+automation caused a worse fault than the one it fixed, and was retracted.
+
+`latsof-setrate --enforce 48000` is the rewrite, and it is safe because it
+**reacts to quiet rather than to change**: notifications only restart a timer,
+and the rate is corrected solely after it has been wrong *continuously* for
+eight seconds. A jack plug settles long before that and never triggers it; a
+call app holding the output at 44.1 does, and gets corrected once. Both
+behaviours were verified before it shipped. Run it from a LaunchAgent if you
+want it permanent — the recipe is in [`INSTALL.md`](INSTALL.md) §7 — or keep
+using the one-shot `latsof-setrate 48000` followed by a replug or sleep/wake.
+Remember that pinning the rate alone never reprograms the codec path; only an
+engine rebuild does.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
 sample rate does.
 

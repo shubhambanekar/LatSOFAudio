@@ -4,30 +4,43 @@
 // WHY: on ALC laptops the analog output crackles/hisses at 44.1 kHz; 48 kHz
 // is clean. macOS re-derives the rate whenever the output engine is rebuilt —
 // every headphone plug or unplug, and some wake paths — and on the reference
-// machine it settles back on 48 kHz by itself. Two cases do not: a cold boot
-// with the jack already occupied, and an engine left genuinely stuck at 44.1.
-// This tool exists for those two cases: run it by hand, once, then rebuild the
-// engine (replug the jack, or sleep/wake). Nothing here belongs in a startup
-// item.
+// machine it settles back on 48 kHz by itself. Three cases do not: a cold boot
+// with the jack already occupied, an engine left genuinely stuck at 44.1, and
+// a call app that deliberately holds the output at 44.1 for the duration of a
+// call (FaceTime does this) — which, against a 48 kHz-only microphone, makes
+// CoreAudio bridge two mismatched clocks until its IO thread starts dropping
+// buffers. For the first two, run this by hand once and then rebuild the engine
+// (replug the jack, or sleep/wake). For the third, the rate change alone is the
+// whole fix, and --enforce automates it.
 //
 // Usage:
-//   latsof-setrate                  report the current rate and exit
-//   latsof-setrate 48000            pin once and exit
-//   latsof-setrate --watch <rate>   RETRACTED — see the warning below
+//   latsof-setrate                    report the current rate and exit
+//   latsof-setrate 48000              pin once and exit
+//   latsof-setrate --enforce 48000    stay resident and keep it there (safely)
 //
 // The one-shot pin is quiet unless it changes something: on a change it prints
 // one timestamped line — the device UID, then "44100 -> 48000 (status 0)" —
 // and if the rate is already right it prints nothing. Either way it exits 0.
-// "--watch" is only recognised as the first argument; anywhere else it is
-// silently ignored and the tool behaves as a one-shot.
+// The mode flag is only recognised as the first argument; anywhere else it is
+// silently ignored and the tool behaves as a one-shot. "--watch" is accepted
+// as an alias for "--enforce".
 //
-// DO NOT RUN --watch RESIDENT. It was written for a LaunchAgent (KeepAlive)
-// and that experiment failed on the reference machine, 29 Jul 2026: a jack
-// plug makes AppleHDA pass through 44.1 kHz while it reprograms the codec, the
-// watcher writes 48 kHz into the middle of that, and stream and codec end up
-// disagreeing — harsh static on headphones AND speakers, curable only by
-// physically replugging (a coreaudiod restart does not clear it). The mode is
-// kept only so the negative result stays reproducible. See INSTALL.md §7.
+// A WARNING ABOUT --enforce, AND WHY IT IS SHAPED THE WAY IT IS.
+// The first resident version of this tool wrote the rate immediately on every
+// change notification, and it made things worse rather than better (reference
+// machine, 29 Jul 2026): a jack plug makes AppleHDA pass through 44.1 kHz
+// while it reprograms the codec, the watcher wrote 48 kHz into the middle of
+// that, and stream and codec ended up disagreeing — harsh static on headphones
+// AND speakers, curable only by physically replugging. That mode was retracted.
+//
+// --enforce is the rewrite, and its single safety property is that it reacts to
+// QUIET rather than to change: notifications only restart a timer, and the rate
+// is corrected solely after it has been wrong CONTINUOUSLY for kSettleSecs with
+// no device activity in between. A jack plug settles by itself long before that
+// window expires, so the dangerous case never fires; a call app holding the
+// output at 44.1 does expire it, and gets corrected once. Verified both ways
+// before shipping. If you modify this file, keep that property: never write the
+// rate in a notification callback. See INSTALL.md §7.
 //
 // Note: a live rate change is not by itself a valid test of the crackle fix —
 // the codec path is only fully reprogrammed when the engine is rebuilt, so
@@ -132,34 +145,93 @@ static void pin_all(int verbose) {
     fflush(stdout);
 }
 
-// A rebuilt engine may accept the rate and then revert it while it finishes
-// initialising, so follow every event with a couple of delayed re-pins.
-static void settle_fired(CFRunLoopTimerRef t, void *info) {
-    (void)t; (void)info;
-    pin_all(0);
-}
+// ==================== --enforce: the debounced resident mode ====================
+//
+// The whole safety of this mode is one rule: NEVER write the rate while the
+// audio engine might be rebuilding. The previous resident implementation wrote
+// immediately on every change notification, which is precisely when AppleHDA
+// is mid-way through reprogramming the codec after a jack plug — stream and
+// codec then disagree and you get static that only another replug clears.
+//
+// So instead of reacting to changes, we react to *quiet*. Every device
+// notification merely records "something moved just now". A timer checks once
+// a second, and only corrects a rate that has been wrong CONTINUOUSLY for
+// kSettleSecs with nothing else happening. The two cases separate cleanly:
+//
+//   jack plug   — 44.1 appears and AppleHDA settles back to 48 within ~1 s,
+//                 well inside the settle window, so we never fire at all
+//   call app    — FaceTime holds the output at 44.1 for the whole call, the
+//                 window expires, and we correct it once
+//
+// A live rate change is safe here because nothing depends on reprogramming the
+// codec path: the fault being fixed is a full-duplex rate MISMATCH between a
+// 48 kHz input engine and a 44.1 kHz output engine, and it disappears the
+// moment the two agree. See INSTALL.md §7.
 
-static void schedule_settle(void) {
-    const CFTimeInterval delays[] = { 0.4, 1.5, 4.0 };
-    for (unsigned i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        CFRunLoopTimerRef t = CFRunLoopTimerCreate(
-            kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + delays[i],
-            0, 0, 0, settle_fired, NULL);
-        if (!t) continue;
-        CFRunLoopAddTimer(CFRunLoopGetCurrent(), t, kCFRunLoopDefaultMode);
-        CFRelease(t);
-    }
-}
+#define kSettleSecs     8.0    // rate must be wrong this long, quietly, first
+#define kPollSecs       1.0
+#define kBurstLimit     5      // corrections per kBurstWindow before backing off
+#define kBurstWindow   60.0
+#define kBackoffSecs   60.0
+
+static CFAbsoluteTime gLastActivity = 0;   // last device/rate notification
+static CFAbsoluteTime gBurstStart   = 0;
+static int            gBurstCount   = 0;
+static CFAbsoluteTime gSettle       = kSettleSecs;
 
 static void watch_devices(void);   // fwd
 
+// Notifications do NOT act. They only note that the audio world just moved,
+// which restarts the settle window.
 static OSStatus on_change(AudioObjectID obj, UInt32 nAddr,
                           const AudioObjectPropertyAddress *addrs, void *ctx) {
     (void)obj; (void)nAddr; (void)addrs; (void)ctx;
-    watch_devices();      // device set may have changed — refresh listeners
-    pin_all(0);
-    schedule_settle();
+    gLastActivity = CFAbsoluteTimeGetCurrent();
+    watch_devices();      // the device set may have changed — refresh listeners
     return noErr;
+}
+
+// Is every analog output engine already at the target?
+static int rate_is_wrong(void) {
+    AudioDeviceID devs[kMaxDevices];
+    int n = list_devices(devs, kMaxDevices);
+    for (int i = 0; i < n; i++) {
+        char uid[256] = "?";
+        if (!device_uid(devs[i], uid, sizeof(uid))) continue;
+        if (!strstr(uid, kTargetUID)) continue;
+        Float64 rate = 0; UInt32 sz = sizeof(rate);
+        if (AudioObjectGetPropertyData(devs[i], &kRateAddr, 0, NULL, &sz, &rate)
+            != noErr) continue;
+        if (rate != gWant) return 1;
+    }
+    return 0;
+}
+
+static void enforce_tick(CFRunLoopTimerRef t, void *info) {
+    (void)t; (void)info;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    if (!rate_is_wrong()) return;                  // nothing to do
+    if (now - gLastActivity < gSettle) return;     // something moved recently
+
+    // Runaway guard: if an app keeps yanking the rate back, stop fighting it
+    // every few seconds and slow down, so the log stays readable and we never
+    // become the noisy party.
+    if (now - gBurstStart > kBurstWindow) { gBurstStart = now; gBurstCount = 0; }
+    if (++gBurstCount > kBurstLimit) {
+        if (gSettle != kBackoffSecs) {
+            gSettle = kBackoffSecs;
+            stamp();
+            printf("something keeps resetting the rate — backing off to %.0fs\n",
+                   kBackoffSecs);
+            fflush(stdout);
+        }
+    } else if (gSettle != kSettleSecs && gBurstCount <= 1) {
+        gSettle = kSettleSecs;
+    }
+
+    pin_all(0);                                    // prints only if it changed
+    gLastActivity = CFAbsoluteTimeGetCurrent();    // our own write counts too
 }
 
 // (Re)register per-device listeners on every analog output engine present.
@@ -183,22 +255,29 @@ static void watch_devices(void) {
 }
 
 int main(int argc, char **argv) {
-    int watch = 0, argi = 1;
-    if (argc > argi && strcmp(argv[argi], "--watch") == 0) { watch = 1; argi++; }
+    int enforce = 0, argi = 1;
+    if (argc > argi && (strcmp(argv[argi], "--enforce") == 0 ||
+                        strcmp(argv[argi], "--watch") == 0)) {
+        enforce = 1; argi++;      // --watch kept as an alias; same safe mode now
+    }
     if (argc > argi) gWant = atof(argv[argi]);
 
-    if (!watch) {                 // one-shot: report, and pin if asked
+    if (!enforce) {               // one-shot: report, and pin if asked
         pin_all(0);
         return 0;
     }
     if (gWant <= 0.0) {
-        fprintf(stderr, "usage: latsof-setrate --watch <rate>\n");
+        fprintf(stderr, "usage: latsof-setrate --enforce <rate>\n");
         return 2;
     }
 
     stamp();
-    printf("watching %s, pinning %.0f Hz\n", kTargetUID, gWant);
+    printf("enforcing %.0f Hz on %s (settle %.0fs)\n",
+           gWant, kTargetUID, (double)kSettleSecs);
     fflush(stdout);
+
+    gLastActivity = CFAbsoluteTimeGetCurrent();
+    gBurstStart   = gLastActivity;
 
     pin_all(1);
     watch_devices();
@@ -206,6 +285,14 @@ int main(int argc, char **argv) {
                                    on_change, NULL);
     AudioObjectAddPropertyListener(kAudioObjectSystemObject, &kDefOutAddr,
                                    on_change, NULL);
+
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(
+        kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + kPollSecs,
+        kPollSecs, 0, 0, enforce_tick, NULL);
+    if (!t) { fprintf(stderr, "timer alloc failed\n"); return 1; }
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), t, kCFRunLoopDefaultMode);
+    CFRelease(t);
+
     CFRunLoopRun();
     return 0;
 }
