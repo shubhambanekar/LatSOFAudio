@@ -345,6 +345,19 @@ static bool gStrictBorrow = true;
 static bool gEngineResumePending = false;
 static int  gEngineResumeTries   = 0;
 
+// patch-32: HOT vs COLD rebuilds need different borrow policies, and one
+// boot-arg cannot express both. Evidence: with latsof_strictborrow=0, three
+// cold wakes borrowed a programmed SD7 instantly and worked every time —
+// but a rebuild during live session churn (the device-switch wedge) burned
+// all 12 tries on "FAILED: ROM IPC timeout", the documented signature of
+// borrowing a programmed descriptor whose session is still hot. So: wake
+// rebuilds honor the boot-arg (fast), while rebuilds triggered by IPC
+// timeouts or capture demands wait for a clean window regardless of it.
+static bool gHotRecovery = false;
+// And never again lose WHY the retries failed: the give-up status used to
+// overwrite the last initDSP failure reason.
+static char gLastInitFail[40] = "";
+
 static bool poll32(volatile UInt8 *b, UInt32 o, UInt32 mask, UInt32 val, UInt32 usec) {
     for (UInt32 t = 0; t < usec; t += 500) {
         if ((rd32(b, o) & mask) == val) return true;
@@ -691,6 +704,7 @@ bool LatSOFAudioDevice::start(IOService *provider) {
             gWakeTries = 0;
             gWakeTickDivider = 0;
             gProgrammedWaits = 0;
+            gHotRecovery = true;   // patch-32: deferred BECAUSE audio was live
             setProperty("Status", "deferred: AppleHDA output busy at load");
             IOLog("LatSOF: AppleHDA output %s at load — deferring DSP init "
                   "to the retry engine (watch Wake-Retry / Status)\n",
@@ -1296,7 +1310,7 @@ bool LatSOFAudioDevice::initDSP() {
         // check exists to prevent.)
         {
             int st2 = outputSdBusyState(hda);
-            if (st2 == 1 || (st2 == 2 && gStrictBorrow &&
+            if (st2 == 1 || (st2 == 2 && (gStrictBorrow || gHotRecovery) &&
                              gProgrammedWaits <= kProgrammedWaitRounds)) {
                 gWakeReinitPending = true;
                 setProperty("Status", "deferred: output became busy before borrow");
@@ -1642,8 +1656,19 @@ bool LatSOFAudioDevice::initDSP() {
                 hdaBase = hda; dspBase = dsp;
                 this->ppCap = ppCap; this->spibCap = spibCap; this->mlCap = mlCap;
                 this->sIdx = sIdx; this->sTag = sTag; this->sd = sd;
-                this->capIdx = 1; this->capTag = 2;  // LATITUDE FORK: SD0 is AppleHDA's
-                this->capSd = SD_BASE + SD_SIZE;  // LATITUDE FORK: descriptor 1
+                // patch-32: capture moved SD1 -> SD6 (last input stream).
+                // SD1 was chosen when AppleHDA had at most ONE input engine
+                // (SD0). Layout 92 brought back TWO (IMic + Lini), and
+                // selecting the second one runs a real DMA stream on the
+                // next free input SD even though the codec pin is dead —
+                // trampling a capture stream parked on SD1. Field failure
+                // 2 Aug 01:20: switch input to Line In -> our capture stop
+                // IPC timed out -> 12 failed rebuilds -> mic dead until
+                // sleep. GCAP says 7 input streams (SD0-SD6); AppleHDA
+                // allocates from the bottom, so SD6 collides only if seven
+                // input engines run at once. Tag follows idx+1 convention.
+                this->capIdx = 6; this->capTag = 7;
+                this->capSd = SD_BASE + 6 * SD_SIZE;
                 this->outboxOff = outboxOff;
                 hwReady = true; isPlaying = false; isCapturing = false; activePlaybackHost = PIPE1_HOST_ID;
 
@@ -1921,6 +1946,7 @@ void LatSOFAudioDevice::scheduleDspRecovery(const char *reason) {
     gWakeReinitPending = true;
     gWakeTries = 0;
     gWakeTickDivider = 0;
+    gHotRecovery = true;      // patch-32: IPC-timeout context — borrow patiently
     // patch-30a: patience is PER EPISODE, not per boot. Without this reset a
     // recovery that follows an earlier one starts with zero patience, borrows
     // AppleHDA's programmed descriptor immediately, and the firmware load then
@@ -2012,6 +2038,7 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
             gWakeTickDivider = 0;
             gRecoveryEpisodes = 0;   // patch-27b: each wake grants a fresh budget
             gProgrammedWaits  = 0;   // patch-30a: and a fresh borrow patience
+            gHotRecovery      = false; // patch-32: cold wake — boot-arg policy
             // review 1 Aug: like every other retry engine here. A wake cycle
             // that skips resumeAudioEngine (engine parked in Resumed after a
             // failed attempt — family only pauses Running engines) would
@@ -2212,7 +2239,7 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
             int st = outputSdBusyState(hdaBase, &g);
             bool decoding = (st != -1);
             bool busy = (st == 1), programmed = false;
-            if (!busy && decoding && gStrictBorrow) {
+            if (!busy && decoding && (gStrictBorrow || gHotRecovery)) {
                 if (st == 2) {
                     if (++gProgrammedWaits <= kProgrammedWaitRounds) {
                         programmed = true;
@@ -2276,8 +2303,11 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 // string is what §2's post-install gate sees, and that gate
                 // says "roll back" — wrong advice when the real story is
                 // "12 attempts exhausted in a busy/hot-load environment".
-                setProperty("Status",
-                            "FAILED: DSP init retries exhausted (see Wake-Retry-Done)");
+                { char gu[96];
+                  snprintf(gu, sizeof(gu),
+                           "FAILED: DSP init retries exhausted (last: %s)",
+                           gLastInitFail[0] ? gLastInitFail : "unknown");
+                  setProperty("Status", gu); }
             } else if (decoding && !busy) {
                 // review 1 Aug round 2: an attempt RAN and FAILED with budget
                 // remaining (initDSP just wrote a bare "FAILED: …" Status).
@@ -2288,9 +2318,11 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 OSString *s = OSDynamicCast(OSString, getProperty("Status"));
                 const char *prev = s ? s->getCStringNoCopy() : nullptr;
                 char st2[96] = "";
-                if (prev && strncmp(prev, "FAILED", 6) == 0)
+                if (prev && strncmp(prev, "FAILED", 6) == 0) {
                     snprintf(st2, sizeof(st2), "deferred: retrying after %s (%d/12)",
                              prev, gWakeTries);
+                    strlcpy(gLastInitFail, prev, sizeof(gLastInitFail));
+                }
                 else if (!prev || strncmp(prev, "deferred", 8) != 0)
                     snprintf(st2, sizeof(st2), "deferred: init attempt %d/12 failed — retrying",
                              gWakeTries);
@@ -2717,6 +2749,25 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
         // this cannot start DMA before the hardware is ready — and never
         // at boot, where the latch is only read by the wake path.
         gWasCapturing = true;
+        // patch-32: the latch alone is not enough when the retry engine has
+        // already GIVEN UP — it would wait for a rebuild that is never
+        // coming, and the mic stayed dead until the next sleep (field
+        // failure 2 Aug: device-switch wedge, 12 failed rebuilds, then
+        // nothing). A refused start is fresh user intent, so treat it like
+        // a wake: re-arm the rebuild with fresh budgets. Runs under the
+        // gate; bounded — each demand buys one 12-try round, and a user
+        // reselecting the mic is exactly who should be able to buy it.
+        if (!gWakeReinitPending && hdaBase && dspBase && pciDevice) {
+            gWakeReinitPending = true;
+            gWakeTries = 0;
+            gWakeTickDivider = 0;
+            gProgrammedWaits = 0;
+            gRecoveryEpisodes = 0;
+            gHotRecovery = true;      // session churn context: borrow patiently
+            setProperty("Wake-Retry", "re-armed by capture demand");
+            IOLog("LatSOF: %s\n",
+                  "capture demanded while DSP down — re-arming rebuild");
+        }
         return kIOReturnNotReady;
     }
     if (isCapturing) return kIOReturnSuccess;
