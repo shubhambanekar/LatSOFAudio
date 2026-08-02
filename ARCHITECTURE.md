@@ -570,10 +570,16 @@ static that only a jack replug cleared. The snapshot/restore contract cannot
 help there; it restores registers, not a running FIFO, and AppleHDA never
 re-programs what it believes it still owns. The wake path already defers while
 the descriptor is busy — `jackPoll` checks `rd8(hdaBase, outSd) & SD_CTL_RUN` —
-but the `start()` path that calls `initDSP()` at `LatSOFAudioDevice.cpp:471` has
-no such check. The right fix is that same preflight on the load path, keeping
-the SD7 borrow. Until it exists: do not hot-load this kext while audio is
-playing. Reboot instead.
+but the `start()` path that calls `initDSP()` had no such check.
+
+**Patch 30 added it.** `outputSdBusyState()` is now called from both `start()`
+and `initDSP()`, classifying the output descriptor as free / RUNNING /
+programmed — RUN clear is not sufficient on its own, because CBL and BDL
+survive after AppleHDA stops a stream. A busy descriptor sets
+`gWakeReinitPending` and bails through `cleanup` *before* the snapshot is
+taken, so the bail writes nothing to a descriptor that is not ours. The old
+procedural rule here — do not hot-load while audio is playing — no longer
+applies, though rebooting remains the calmer path.
 
 Given the loan is unavoidable, the contract is:
 
