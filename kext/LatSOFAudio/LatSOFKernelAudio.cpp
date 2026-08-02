@@ -27,6 +27,14 @@
 #define kWrapPollMS         100
 #define kDCSeedPending      0xFFFFFFFFu   // dcNextFrame: seed from first IO request
 
+// patch-29 clock accuracy (see readPositionAtEdge). All bounds are in TIME,
+// never in loop iterations: IODelay plus an uncached MMIO read costs more
+// than the delay alone, so counting iterations understates the real bound.
+#define kEdgeSpinUS         5             // pause between DPIB polls
+#define kEdgeDeadlineNS     2000000ULL    // 2 ms: ~2x the worst observed dwell
+#define kEdgeReadWindowNS   20000ULL      // >20 us around a read = preempted
+#define kRingPeriodNS       (((UInt64)kEngineFrames * 1000000000ULL) / kEngineSampleRate)
+
 // ==================== device ====================
 
 OSDefineMetaClassAndStructors(LatSOFKernelAudioDevice, IOAudioDevice)
@@ -62,6 +70,15 @@ bool LatSOFKernelAudioDevice::initHardware(IOService *provider) {
     return true;
 }
 
+// See the header comment: the owner must stop reading `engine` before the
+// family frees it below in deactivateAllAudioEngines. The notification runs
+// under the owner's commandGate, so it strictly precedes any later gated
+// reader — which then sees nullptr instead of a dangling pointer.
+void LatSOFKernelAudioDevice::stop(IOService *provider) {
+    if (owner) owner->kernelAudioTearingDown(this);
+    IOAudioDevice::stop(provider);
+}
+
 // ==================== engine ====================
 
 OSDefineMetaClassAndStructors(LatSOFKernelAudioEngine, IOAudioEngine)
@@ -75,6 +92,17 @@ bool LatSOFKernelAudioEngine::initWithOwner(LatSOFAudioDevice *o) {
     gainMilliDecibels = 30000;   // +30 dB ≈ the plugin's 32x software gain
     dcX1[0] = dcX1[1] = dcY1[0] = dcY1[1] = 0.0f;
     dcNextFrame = kDCSeedPending;
+    edgeMisses = notReadyPolls = preemptRejects = 0;
+    AbsoluteTime zero = 0;
+    lastStampTime = zero;
+    // Kill switch, kept because patch-28 shipped a design the hardware
+    // rejected: latsof_edgelock=0 restores the previous timing behaviour
+    // without a rebuild, while keeping the validity guard.
+    UInt32 el = 1;
+    if (PE_parse_boot_argn("latsof_edgelock", &el, sizeof(el)))
+        edgeLockEnabled = (el != 0);
+    else
+        edgeLockEnabled = true;
     return true;
 }
 
@@ -213,6 +241,92 @@ void LatSOFKernelAudioEngine::stampBackdated(bool incrementLoop, UInt32 framesAg
     takeTimeStamp(incrementLoop, &ts);
 }
 
+// Stamp an event that happened `framesAgo` frames before an EXPLICIT host
+// time, rather than before "now". Every caller that spins before stamping
+// must use this: back-dating from a clock read taken after the spin, using a
+// position read taken before it, lands the anchor late by the whole spin.
+void LatSOFKernelAudioEngine::stampAt(bool incrementLoop, AbsoluteTime at,
+                                      UInt32 framesAgo) {
+    AbsoluteTime ts;
+    UInt64 atNs = 0;
+    absolutetime_to_nanoseconds(at, &atNs);
+    UInt64 agoNs = ((UInt64)framesAgo * 1000000000ULL) / kEngineSampleRate;
+    nanoseconds_to_absolutetime(atNs > agoNs ? atNs - agoNs : 0, &ts);
+    lastStampTime = at;
+    takeTimeStamp(incrementLoop, &ts);
+}
+
+// Position read that distinguishes "unknown" from "frame 0".
+bool LatSOFKernelAudioEngine::readPosition(UInt32 *posOut) {
+    if (!owner || !owner->capturePositionValid()) return false;
+    *posOut = getCurrentSampleFrame();
+    return true;
+}
+
+// Read the capture position AND the host time at which it changed.
+//
+// WHY: DPIB is a completed-transfer counter that only advances when the DSP
+// pipeline ticks (this driver declares period = 1000 us in its PIPELINE
+// COMP_NEW IPC), so between ticks it is frozen and a read UNDER-reports the
+// true write head. stampBackdated()'s model — "the wrap happened
+// framesAgo/48000 seconds ago" — is exact only at the instant DPIB updates.
+// Reading at a random instant therefore places the anchor late by a random
+// fraction of a tick, and IOAudioEngine.h is explicit that fLastLoopTime
+// accuracy "is the basis for the entire timer and synchronization mechanism
+// used by the audio system".
+//
+// So: spin until the register moves, and pair that new value with a clock
+// read taken immediately around it.
+//
+// Two properties this must have, both learned from review rather than
+// discovered afterwards:
+//   1. The deadline is measured in TIME, not iterations. IODelay(5) plus an
+//      uncached MMIO read costs more than 5 us, so counting iterations
+//      understates the real bound by 2-3x.
+//   2. IODelay spins with preemption ENABLED. If this thread is descheduled
+//      between the position read and the clock read, the pair is a lie and
+//      stamping it would be worse than today's bounded error. Bracket the
+//      read and DISCARD any sample whose read window is implausibly long.
+//      Rejecting a poisoned sample is what makes the scheme defensible.
+//
+// Returns false if the position never moved before the deadline, or validity
+// was lost mid-spin; the caller must then fall back using a time captured
+// BEFORE the spin.
+bool LatSOFKernelAudioEngine::readPositionAtEdge(UInt32 *posOut, AbsoluteTime *tOut) {
+    UInt32 p0;
+    if (!readPosition(&p0)) return false;
+
+    AbsoluteTime start;
+    clock_get_uptime(&start);
+    UInt64 startNs = 0;
+    absolutetime_to_nanoseconds(start, &startNs);
+
+    for (;;) {
+        AbsoluteTime tA, tB;
+        UInt32 p;
+
+        clock_get_uptime(&tA);
+        if (!readPosition(&p)) return false;
+        clock_get_uptime(&tB);
+
+        UInt64 aNs = 0, bNs = 0;
+        absolutetime_to_nanoseconds(tA, &aNs);
+        absolutetime_to_nanoseconds(tB, &bNs);
+
+        if (bNs - aNs <= kEdgeReadWindowNS) {       // sample is trustworthy
+            if (p != p0) { *posOut = p; *tOut = tB; return true; }
+        } else {
+            preemptRejects++;                        // descheduled mid-read
+        }
+
+        if (bNs - startNs >= kEdgeDeadlineNS) break; // time-bounded, not count
+        IODelay(kEdgeSpinUS);
+    }
+
+    edgeMisses++;
+    return false;
+}
+
 IOReturn LatSOFKernelAudioEngine::performAudioEngineStart() {
     if (!owner) return kIOReturnNotReady;
     // Gated entry; routed through the owner's commandGate (the family does
@@ -227,11 +341,26 @@ IOReturn LatSOFKernelAudioEngine::performAudioEngineStart() {
     // client retry after the wake window), DPIB is mid-ring: declare t0
     // back-dated by the current position so the HAL's frame math starts
     // aligned instead of up to one ring (~341 ms) skewed.
-    UInt32 pos = getCurrentSampleFrame();
-    lastWrapFrame = pos;
+    AbsoluteTime t0;
+    clock_get_uptime(&t0);            // before any spin, as in wrapTimerFired
     engineRunning = true;
-    stampBackdated(false, pos);
+
+    UInt32 pos = 0;
+    AbsoluteTime edgeTime = 0;
+    bool edged = edgeLockEnabled && readPositionAtEdge(&pos, &edgeTime);
+    if (edged) {
+        lastWrapFrame = pos;
+        stampAt(false, edgeTime, pos);
+    } else {
+        pos = getCurrentSampleFrame();
+        lastWrapFrame = pos;
+        stampAt(false, t0, pos);
+    }
     if (wrapTimer) wrapTimer->setTimeoutMS(kWrapPollMS);
+    // One line per session start: session-start timeline marker for tests.
+    // "edge=1" means the anchor came from a caught DPIB tick (patch-29).
+    IOLog("LatSOF: engine start pos=%u edge=%d clients=%u\n",
+          pos, edged ? 1 : 0, (unsigned)numActiveUserClients);
     return kIOReturnSuccess;
 }
 
@@ -239,6 +368,72 @@ IOReturn LatSOFKernelAudioEngine::performAudioEngineStop() {
     engineRunning = false;
     if (wrapTimer) wrapTimer->cancelTimeout();
     if (owner) owner->engineStopCapture();
+    // Publish the session's clock anomalies so they survive into ioreg after
+    // the call ends. All three should be 0 or near it; a rising edgeMisses
+    // means the DSP is stalling or the deadline is too tight, and a non-zero
+    // notReadyPolls proves a recovery/wake window was crossed mid-session.
+    setProperty("Clock-Edge-Misses",   edgeMisses,     32);
+    setProperty("Clock-NotReady-Polls", notReadyPolls, 32);
+    setProperty("Clock-Preempt-Rejects", preemptRejects, 32);
+    // Counters are cumulative per boot; the log line gives each session's
+    // snapshot without needing ioreg between test steps.
+    IOLog("LatSOF: engine stop edgeMisses=%u notReadyPolls=%u preemptRejects=%u\n",
+          edgeMisses, notReadyPolls, preemptRejects);
+    return kIOReturnSuccess;
+}
+
+// patch-30: see the header comment. Latch only — the actual restart must
+// wait for the owner's retry engine, because resume fires on the family PM
+// path seconds before the DSP rebuild completes, and a synchronous start
+// here would burn its one shot on kIOReturnNotReady.
+IOReturn LatSOFKernelAudioEngine::resumeAudioEngine() {
+    IOReturn r = IOAudioEngine::resumeAudioEngine();
+    // state/clients at resume time are the whole story of test §6.1 vs §6.2:
+    // clients>0 here is a session that MUST come back; clients==0 must not.
+    IOLog("LatSOF: resumeAudioEngine state=%d clients=%u — latching deferred restart\n",
+          (int)getState(), (unsigned)numActiveUserClients);
+    if (owner) owner->engineRequestResume();
+    return r;
+}
+
+// Executed by the owner's jackPoll once hwReady is back. Goes through the
+// FAMILY's startAudioEngine rather than any side channel so DMA, engine
+// state, the patch-29 edge-anchored timestamp and the Started notification
+// to the HAL all come back through the one audited path. On a Resumed
+// engine startAudioEngine falls through to performAudioEngineStart
+// (IOAudioFamily-740.1:1806); on a Paused one it merely resumes, so a
+// nested pauseCount is drained first and the executor's bounded retries
+// cover the remainder.
+IOReturn LatSOFKernelAudioEngine::completeDeferredResume(const char **outcome) {
+    if (outcome) *outcome = "idle";
+    IOAudioEngineState s = getState();
+    if (s == kIOAudioEngineRunning) {
+        if (outcome) *outcome = "already running";
+        IOLog("LatSOF: %s\n", "deferred resume: already running — no-op");
+        return kIOReturnSuccess;                               // client won the race
+    }
+    if (numActiveUserClients == 0) {
+        if (outcome) *outcome = "no clients";
+        IOLog("LatSOF: %s\n", "deferred resume: no clients — nothing to restart");
+        return kIOReturnSuccess;                               // nobody held a session
+    }
+    IOLog("LatSOF: deferred resume: starting engine (state=%d clients=%u)\n",
+          (int)s, (unsigned)numActiveUserClients);
+    if (s == kIOAudioEnginePaused) IOAudioEngine::resumeAudioEngine();
+    IOReturn r = startAudioEngine();
+    if (r != kIOReturnSuccess) return r;
+    // Never claim a restart we cannot see. startAudioEngine returns SUCCESS
+    // on a Paused engine while only draining one pause level (740.1:1801) —
+    // so with a nested pauseCount the engine ends up Resumed, not Running,
+    // and clearing the latch here would strand the session silently. Report
+    // busy instead: the executor's bounded retry drains the next level on
+    // the following tick, and its telemetry stays honest either way.
+    if (getState() != kIOAudioEngineRunning) {
+        IOLog("LatSOF: %s\n",
+              "deferred resume: nested pause drained, not running yet — will retry");
+        return kIOReturnBusy;
+    }
+    if (outcome) *outcome = "restarted";
     return kIOReturnSuccess;
 }
 
@@ -251,13 +446,58 @@ UInt32 LatSOFKernelAudioEngine::getCurrentSampleFrame() {
 void LatSOFKernelAudioEngine::wrapTimerFired(OSObject *target, IOTimerEventSource *sender) {
     auto *self = OSDynamicCast(LatSOFKernelAudioEngine, target);
     if (!self || !self->engineRunning) return;
-    UInt32 now = self->getCurrentSampleFrame();
+
+    // Capture the entry time BEFORE anything that can spin. Every fallback
+    // path below back-dates from this, never from a clock read taken after
+    // the edge spin — a stamp built from a pre-spin position and a post-spin
+    // clock lands late by the whole spin, which is a far worse outlier than
+    // the sub-millisecond error the spin exists to remove.
+    AbsoluteTime t0;
+    clock_get_uptime(&t0);
+
+    UInt32 now;
+    if (!self->readPosition(&now)) {
+        // DSP is down (recovery, wake retry, or sleep teardown): DPIB reads
+        // as 0, which is NOT a wrap. Stamping it would inject a phantom
+        // +341 ms loop increment with zero elapsed host time.
+        //
+        // But do not simply go silent either. These windows are not short —
+        // a rebuild takes >=1.5 s and defers while AppleHDA output is busy —
+        // and a frozen fLastLoopTime stalls a client's read head outright,
+        // which is worse for a live recording than a discontinuity. So
+        // free-run the timeline at the nominal rate: keep issuing one loop
+        // increment per ring period of REAL elapsed time, so sample time and
+        // host time stay locked together across the outage. When capture
+        // returns, the next genuine edge re-anchors it.
+        self->notReadyPolls++;
+        UInt64 lastNs = 0, nowNs = 0;
+        absolutetime_to_nanoseconds(self->lastStampTime, &lastNs);
+        absolutetime_to_nanoseconds(t0, &nowNs);
+        if (lastNs != 0 && nowNs - lastNs >= kRingPeriodNS) {
+            AbsoluteTime due;
+            nanoseconds_to_absolutetime(lastNs + kRingPeriodNS, &due);
+            self->stampAt(true, due, 0);
+        }
+        if (sender) sender->setTimeoutMS(kWrapPollMS);
+        return;                      // lastWrapFrame deliberately untouched
+    }
+
     // Ring period is ~341 ms; polling at 100 ms means a wrap is seen as
-    // position moving backwards exactly once per cycle. The wrap happened
-    // `now` frames ago — back-date the stamp; stamping "poll time" would
-    // inject up to 100 ms of jitter per loop into the HAL's clock.
-    if (now < self->lastWrapFrame)
-        self->stampBackdated(true, now);
+    // position moving backwards exactly once per cycle.
+    if (now < self->lastWrapFrame) {
+        UInt32 edgePos;
+        AbsoluteTime edgeTime;
+        if (self->edgeLockEnabled &&
+            self->readPositionAtEdge(&edgePos, &edgeTime)) {
+            // Exact pair: position and the host time it became true.
+            self->stampAt(true, edgeTime, edgePos);
+            now = edgePos;           // keep lastWrapFrame consistent with the
+                                     // value the stamp was actually built from
+        } else {
+            // Fall back to t0 — the clock read from BEFORE any spin.
+            self->stampAt(true, t0, now);
+        }
+    }
     self->lastWrapFrame = now;
     if (sender) sender->setTimeoutMS(kWrapPollMS);
 }

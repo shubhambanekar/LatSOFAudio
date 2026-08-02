@@ -45,8 +45,18 @@ class LatSOFKernelAudioDevice : public IOAudioDevice {
 public:
     virtual bool initHardware(IOService *provider) override;
     virtual IOWorkLoop *getWorkLoop() const override;
+    // review 1 Aug round 3: the engine member is unretained after
+    // activateAudioEngine and the family frees it inside stop()'s
+    // deactivateAllAudioEngines — while the owner's gated readers (wake
+    // re-latch, jackPoll executor) may still call getEngine(). This
+    // override tells the owner, under its gate, to drop the resume latch
+    // and null the pointer BEFORE the free. Covers IOKit-initiated
+    // termination too, which never goes through the owner's stop().
+    virtual void stop(IOService *provider) override;
 
     void setOwner(LatSOFAudioDevice *o) { owner = o; }
+    LatSOFKernelAudioEngine *getEngine() const { return engine; }
+    void clearEngine() { engine = nullptr; }   // gated callers only
 
 private:
     LatSOFAudioDevice *owner;   // not retained; owner outlives us by design
@@ -67,6 +77,28 @@ public:
     virtual IOReturn performAudioEngineStop() override;
     virtual UInt32 getCurrentSampleFrame() override;
 
+    // patch-30: the family's pause/resume is asymmetric — pauseAudioEngine
+    // calls performAudioEngineStop, but resumeAudioEngine only flips state
+    // to Resumed and never calls performAudioEngineStart (verified against
+    // IOAudioFamily-740.1 source). Nothing restarts our capture after the
+    // PM resume, so a session held across sleep stays silent until reboot
+    // (HANDOFF §5e). The override latches a restart request with the owner;
+    // jackPoll executes it via completeDeferredResume once the DSP rebuild
+    // has verifiably succeeded — one synchronous shot at resume time is the
+    // design that failed all week (the DSP is still down when resume fires).
+    virtual IOReturn resumeAudioEngine() override;
+    // outcome (optional) receives a short literal for the Engine-Resume
+    // property: "restarted", "already running", "no clients", or "idle".
+    IOReturn completeDeferredResume(const char **outcome);
+    // True when a client still holds a session but the engine is not
+    // Running — the state an exhausted executor leaves behind. The owner's
+    // wake path re-arms the latch on it: the family only pauses Running
+    // engines at sleep and only resumes Paused ones at wake, so once parked
+    // in Resumed no resumeAudioEngine call will ever come again on its own.
+    bool needsDeferredResume() {
+        return numActiveUserClients > 0 && getState() != kIOAudioEngineRunning;
+    }
+
     virtual IOReturn convertInputSamples(const void *sampleBuf, void *destBuf,
                                          UInt32 firstSampleFrame, UInt32 numSampleFrames,
                                          const IOAudioStreamFormat *streamFormat,
@@ -86,6 +118,22 @@ private:
     float dcX1[2], dcY1[2];
     UInt32 dcNextFrame;                 // multi-client guard; kDCSeedPending until first IO
 
+    // patch-29 clock accuracy. DPIB is not a continuous counter: it advances
+    // in a staircase locked to the DSP's 1 ms pipeline period, so a read at a
+    // random instant under-reports the true write head. Back-dating from it
+    // places every timestamp late by a random fraction of a millisecond —
+    // measured at 17.84 frames RMS against AppleHDA's 0.37 on the same
+    // harness. Catching the staircase edge makes the (position, time) pair
+    // exact. See the block comment above readPositionAtEdge().
+    UInt32 edgeMisses;                  // DPIB never moved before the deadline
+    UInt32 notReadyPolls;               // wrap poll skipped: position invalid
+    UInt32 preemptRejects;              // sample discarded: read was preempted
+    AbsoluteTime lastStampTime;         // host time of the last stamp we issued
+    bool   edgeLockEnabled;             // boot-arg kill switch: latsof_edgelock=0
+
+    bool readPosition(UInt32 *posOut);
+    bool readPositionAtEdge(UInt32 *posOut, AbsoluteTime *tOut);
+    void stampAt(bool incrementLoop, AbsoluteTime at, UInt32 framesAgo);
     void stampBackdated(bool incrementLoop, UInt32 framesAgo);
     static void wrapTimerFired(OSObject *target, IOTimerEventSource *sender);
     static IOReturn gainChangeHandler(OSObject *target, IOAudioControl *control,

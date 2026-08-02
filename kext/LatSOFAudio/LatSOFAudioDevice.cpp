@@ -288,6 +288,22 @@ static inline void   wr8(volatile UInt8 *b, UInt32 o, UInt8 v)  { *(volatile UIn
 static bool gWakeReinitPending = false;
 static int  gWakeTries = 0;
 static int  gWakeTickDivider = 0;
+// review 1 Aug: the wake branch used to infer "this is a real wake" from
+// !hwReady, which was only correct because start() always ran initDSP. The
+// patch-30 deferred load reaches the initial PM registration with hwReady
+// still false, and the wake branch would then release and rebuild BAR maps
+// start() just created — harmless when the remap works, but a remap failure
+// in that window nulls hdaBase/dspBase and strands the deferral until the
+// next physical sleep. Track sleeps explicitly instead of inferring them.
+static bool gSleptOnce = false;
+// review 1 Aug round 4: sleep-imminent latch for the resume executor. The
+// family power-state reads are TOCTOU against its private PM workloop
+// (currentPowerState is stored only AFTER the sleep pause; pending is
+// better but still cross-thread). kIOMessageSystemWillSleep is
+// non-vetoable, arrives gated, and strictly precedes every setPowerState(0)
+// in the tree — so this latch, written and read only under the gate, parks
+// the executor across the whole WillSleep -> wake span race-free.
+static bool gSleepImminent = false;
 
 // LATITUDE FORK patch-24: capture re-arm across sleep.
 //
@@ -312,10 +328,141 @@ static bool gWasCapturing = false;
 // successful capture start or on a genuine sleep/wake.
 static int gRecoveryEpisodes = 0;
 
+// patch-30: how many 1.5 s rounds to wait for AppleHDA to release its output
+// descriptor before borrowing it anyway. 20 rounds = ~30 s: long enough for
+// an idle engine to be torn down, short enough that a wake never costs the
+// microphone for more than half a minute.
+#define kProgrammedWaitRounds 20
+static int  gProgrammedWaits = 0;
+// Escape hatch, per the patch-28 lesson: latsof_strictborrow=0 restores the
+// old RUN-bit-only preflight without a rebuild.
+static bool gStrictBorrow = true;
+
+// patch-30 fix 1: deferred engine-resume latch (see engineRequestResume).
+// Same single-writer discipline as the other latches in this file: set and
+// cleared only under the commandGate / on the workloop.
+#define kEngineResumeMaxTries 3
+static bool gEngineResumePending = false;
+static int  gEngineResumeTries   = 0;
+
 static bool poll32(volatile UInt8 *b, UInt32 o, UInt32 mask, UInt32 val, UInt32 usec) {
     for (UInt32 t = 0; t < usec; t += 500) {
         if ((rd32(b, o) & mask) == val) return true;
         IODelay(500);
+    }
+    return false;
+}
+
+// patch-30 fix 2: one predicate for "is AppleHDA's output descriptor ours to
+// borrow", shared by the load path and the wake path so the two can never
+// disagree again. Returns -1 controller-not-decoding, 0 quiet, 1 RUN set,
+// 2 programmed (CBL/BDL live — RUN clear is not enough, see the jackPoll
+// comment: FIFO and DMA position are not register state and cannot be handed
+// back to a stream AppleHDA already programmed).
+static int outputSdBusyState(volatile UInt8 *hda, UInt16 *gcapOut = nullptr) {
+    UInt16 g = rd16(hda, HDA_GCAP);
+    if (gcapOut) *gcapOut = g;   // callers log the value the DECISION used
+    if (g == 0xFFFF || g == 0x0000) return -1;
+    UInt32 o = SD_BASE + (UInt32)((g >> 8) & 0xF) * SD_SIZE;
+    if (rd8(hda, o) & SD_CTL_RUN) return 1;
+    if (rd32(hda, o + SD_REG_CBL) || rd32(hda, o + SD_REG_BDLPL) ||
+        rd32(hda, o + SD_REG_BDLPU)) return 2;
+    return 0;
+}
+
+// ==================== patch-31: in-kernel AFG wake ====================
+//
+// Replaces the latsof-afgwake userland daemon (and its Login Items entry).
+// MEASURED FAULT (1 Aug): when a jack event lands on an idle engine, AppleHDA
+// starts streaming without restoring the codec's Audio Function Group (node
+// 0x01) from D3 — audio drives a powered-down path, harsh static, cured only
+// by a replug (which forces a full re-init). Writing SET_POWER_STATE D0 to
+// the AFG clears it instantly; children cascade.
+//
+// HOW WE TALK TO THE CODEC. Not CORB/RIRB — that ring is AppleHDA's, and
+// contending on it is the same shared-resource bet that cost patches 24-30a.
+// The HDA spec provides a second, controller-arbitrated path: the Immediate
+// Command Interface (ICOI/IRII/ICIS at 0x60/0x64/0x68). The controller
+// injects the command into the link stream itself and routes the response to
+// IRII, not RIRB. We claim it only when idle (ICB clear), bound every wait,
+// and bail silently on contention or timeout — a lost round costs nothing
+// because the next tick retries.
+//
+// WHEN WE ACT — the discipline that made the daemon safe, plus one insight
+// the daemon could not use: SD7's descriptor is visible to us by pure MMIO.
+// A clean->programmed/RUN transition on AppleHDA's output descriptor IS the
+// engine rebuild that follows a jack insert or playback start — the exact
+// moment the fault is born, observable without a single codec command. So:
+//   - steady idle:      zero codec traffic (D3 is correct there — leave it)
+//   - on SD transition: one GET_POWER_STATE; SET D0 only if not D0
+//   - while RUN:        a belt check every ~10 s (one verb), nothing more
+// SET_POWER_STATE D0 is idempotent and monotonic (only ever powers UP), so
+// even a misjudged write cannot leave two pieces of state disagreeing.
+//
+// Escape hatch: latsof_afgwake=0 reverts to the userland daemon without a
+// rebuild. If ICI itself proves unusable on this controller (never observed,
+// but the spec allows quirks), the code counts failures and retires itself,
+// publishing AFG-Wake = "ICI unavailable" so the daemon is known to be needed.
+#define HDA_ICOI            0x60
+#define HDA_IRII            0x64
+#define HDA_ICIS            0x68
+#define ICIS_ICB            0x1     // immediate command busy
+#define ICIS_IRV            0x2     // immediate result valid (W1C)
+#define kAfgNid             0x01
+// HDA command word: (CAd << 28) | (NID << 20) | (verb12 << 8) | payload8.
+// The NID field is bits 27:20 and is easy to leave out — the first cut of
+// this patch shipped 0x000F0500/0x00070500, which addresses node 0x00 (the
+// ROOT node) instead of the AFG. Root has no power state, so it answered 0,
+// the code read that as "already D0", and it silently never corrected
+// anything: no AFG-Wake property, no ICI failure, just a headphone hiss the
+// daemon had to catch. Build the words from the parts so it cannot recur.
+#define kHdaVerb(nid, verb, payload) \
+    (((UInt32)(nid) << 20) | ((UInt32)(verb) << 8) | (UInt32)(payload))
+#define kVerbGetPower       kHdaVerb(kAfgNid, 0xF05, 0x00)   // 0x001F0500
+#define kVerbSetPowerD0     kHdaVerb(kAfgNid, 0x705, 0x00)   // 0x00170500
+// patch-31b: jack sense on the headphone pin. SD7 alone is too late —
+// AppleHDA does not touch that descriptor until playback starts, which is
+// the same instant the fault becomes audible (measured: ~0.5 s of static
+// before the SD-triggered correction landed). The CODEC knows sooner: pin
+// 0x21's presence bit (31) flips when the connector seats, seconds before
+// anyone presses play. Polling it is what lets the kext pre-arm the way the
+// userland daemon did via CoreAudio jack notifications.
+#define kHpPinNid           0x21
+#define kVerbGetPinSense    kHdaVerb(kHpPinNid, 0xF09, 0x00)
+#define kPinPresent         0x80000000u
+#define kAfgSenseTicks      2       // poll jack sense every 2nd tick (~1 s)
+#define kAfgBeltTicks       20      // RUN belt check: every 20th 500 ms tick
+#define kAfgIciFailLimit    8       // consecutive ICI failures -> retire
+
+static bool gAfgKextWake  = true;   // boot-arg latsof_afgwake=0 disables
+static int  gAfgLastSd    = -2;     // last outputSdBusyState (-2 = unseen)
+static UInt32 gAfgLastSig = 0;      // last BDL^CBL^FMT signature of SD7
+static int  gAfgSenseTick = 0;      // jack-sense poll divider
+static bool gAfgJackWasIn = false;  // last observed jack presence
+static int  gAfgBeltTick  = 0;
+static int  gAfgIciFails  = 0;
+static UInt32 gAfgWakes   = 0;      // corrections issued (telemetry)
+static bool   gAfgProbed  = false;  // published the first successful ICI read
+
+// One immediate-interface verb. Returns false on contention or timeout —
+// caller treats that as "not this tick", never as an error to act on.
+static bool iciVerb(volatile UInt8 *hda, UInt32 verb, UInt32 *resp) {
+    for (int t = 0; ; t++) {                     // claim only a quiet ICI
+        if (!(rd16(hda, HDA_ICIS) & ICIS_ICB)) break;
+        if (t >= 100) return false;              // ~1 ms: someone else owns it
+        IODelay(10);
+    }
+    wr16(hda, HDA_ICIS, ICIS_IRV);               // W1C any stale response
+    wr32(hda, HDA_ICOI, verb);
+    wr16(hda, HDA_ICIS, ICIS_ICB);
+    for (int t = 0; t < 100; t++) {              // ~1 ms response bound
+        UInt16 s = rd16(hda, HDA_ICIS);
+        if (s & ICIS_IRV) {
+            if (resp) *resp = rd32(hda, HDA_IRII);
+            wr16(hda, HDA_ICIS, ICIS_IRV);
+            return true;
+        }
+        IODelay(10);
     }
     return false;
 }
@@ -468,9 +615,106 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     hdaBase = (volatile UInt8 *)hdaBarMap->getVirtualAddress();
     dspBase = (volatile UInt8 *)dspBarMap->getVirtualAddress();
 
-    if (!initDSP()) {
-        setProperty("Status", "FAILED: DSP init"), IOLog("LatSOF: %s\n", "FAILED: DSP init");
+    {   // patch-30 escape hatch (see the preflight in jackPoll)
+        UInt32 sb = 1;
+        if (PE_parse_boot_argn("latsof_strictborrow", &sb, sizeof(sb)))
+            gStrictBorrow = (sb != 0);
+        // patch-31 escape hatch: latsof_afgwake=0 reverts the AFG keep-alive
+        // to the userland daemon without a rebuild.
+        UInt32 aw = 1;
+        if (PE_parse_boot_argn("latsof_afgwake", &aw, sizeof(aw)))
+            gAfgKextWake = (aw != 0);
+    }
+
+    // patch-30 fix 2: allocate the capture ring here, not in initDSP. This
+    // is what lets the load path DEFER initDSP (below) and still publish the
+    // kernel audio device: the engine's initHardware needs the ring, nothing
+    // in it needs the DSP. Pure memory, no MMIO; initDSP's own !capDmaBuf
+    // guards make its copy of this block a no-op.
+    {
+        if (!capDmaBuf) {
+            capDmaBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+                kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+                kLatSOF_CapBufferSize, 0xFFFFFFFFFFFFF000ULL);
+            if (capDmaBuf) capDmaBuf->prepare();
+        }
+        // review 1 Aug: BDL only if the ring exists (same rule as initDSP's
+        // copy — see the comment there).
+        if (!capBdlBuf && capDmaBuf) {
+            UInt32 numBdl = (kLatSOF_CapBufferSize + PAGE_SIZE - 1) / PAGE_SIZE;
+            UInt32 bdlSz = ((numBdl * 16) + 127) & ~127U;
+            capBdlBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+                kIOMemoryPhysicallyContiguous | kIODirectionInOut, bdlSz, 0xFFFFFFFFFFFFFF80ULL);
+            if (capBdlBuf && capDmaBuf) {
+                capBdlBuf->prepare();
+                HdaBdlEntry *cbdl = (HdaBdlEntry *)capBdlBuf->getBytesNoCopy();
+                memset(cbdl, 0, bdlSz);
+                UInt64 cphys = capDmaBuf->getPhysicalAddress();
+                UInt32 crem = kLatSOF_CapBufferSize;
+                for (UInt32 i = 0; i < numBdl && crem > 0; i++) {
+                    UInt32 chunk = (crem > PAGE_SIZE) ? PAGE_SIZE : crem;
+                    cbdl[i].addrLow = (UInt32)(cphys & 0xFFFFFFFF);
+                    cbdl[i].addrHigh = (UInt32)(cphys >> 32);
+                    cbdl[i].size = chunk; cbdl[i].ioc = 1;
+                    crem -= chunk; cphys += chunk;
+                }
+            }
+        }
+    }
+
+    // review 1 Aug round 4: the deferred path publishes the mic device from
+    // this ring BEFORE any initDSP runs — an allocation failure here would
+    // silently forfeit the Siri-visible device for the whole boot (the
+    // engine's initHardware fails once and never retries). Fail loudly
+    // instead: the §2 gate sees FAILED and the load is retried/rolled back.
+    if (!capDmaBuf || !capBdlBuf) {
+        setProperty("Status", "FAILED: capture ring allocation");
+        IOLog("LatSOF: %s\n", "FAILED: capture ring allocation at load");
         goto fail;
+    }
+
+    // patch-30 fix 2: the load-path preflight §6.5 always lacked. Loading
+    // while AppleHDA's output stream is RUN (or programmed, under strict
+    // borrow) used to borrow it anyway — instant loud static, replug-proof,
+    // observed with SD-Borrow ctl=0x14001e. The wake path solved this with
+    // deferral to jackPoll's retry engine; hand the load path the exact same
+    // machinery instead of a warning. A bounded sleep-wait here was rejected:
+    // it blocks the kmutil/matching thread for up to 30 s, and when it
+    // expires mid-playback it commits the very static it exists to prevent.
+    // st == -1 (controller not decoding) must NOT defer — fall into initDSP
+    // so its own GCAP wait and failure reporting still hard-fail start().
+    {
+        int st = outputSdBusyState(hdaBase);
+        bool deferInit = (st == 1) || (st == 2 && gStrictBorrow);
+        if (deferInit) {
+            gWakeReinitPending = true;
+            gWakeTries = 0;
+            gWakeTickDivider = 0;
+            gProgrammedWaits = 0;
+            setProperty("Status", "deferred: AppleHDA output busy at load");
+            IOLog("LatSOF: AppleHDA output %s at load — deferring DSP init "
+                  "to the retry engine (watch Wake-Retry / Status)\n",
+                  (st == 1) ? "RUNNING" : "programmed");
+        } else if (st == 2) {
+            IOLog("LatSOF: %s\n", "output programmed at load but "
+                  "latsof_strictborrow=0 — borrowing anyway");
+        } else if (st == -1) {
+            IOLog("LatSOF: %s\n", "controller not decoding at load — "
+                  "initDSP will wait/report as before");
+        }
+        if (!deferInit && !initDSP()) {
+            if (gWakeReinitPending) {
+                // round 4: the borrow-time re-check inside initDSP bailed —
+                // output became busy between preflight and borrow. Same
+                // deferral as the preflight's own; retry engine takes over.
+                gWakeTries = 0;
+                gWakeTickDivider = 0;
+                gProgrammedWaits = 0;
+            } else {
+                setProperty("Status", "FAILED: DSP init"), IOLog("LatSOF: %s\n", "FAILED: DSP init");
+                goto fail;
+            }
+        }
     }
 
     // Create the commandGate BEFORE registering for PM / installing event
@@ -546,6 +790,13 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     return true;
 
 fail:
+    // review 1 Aug: the hoisted capture ring is allocated before initDSP can
+    // fail, and stop() never runs after a failed start() — without these two
+    // lines every failed load leaks ~128 KiB of wired contiguous memory.
+    // Non-null implies prepared here (the pair-atomic guards above), and no
+    // DMA references the ring on this path (hwReady never went true).
+    if (capBdlBuf) { capBdlBuf->complete(); capBdlBuf->release(); capBdlBuf = nullptr; }
+    if (capDmaBuf) { capDmaBuf->complete(); capDmaBuf->release(); capDmaBuf = nullptr; }
     if (hdaBarMap) { hdaBarMap->release(); hdaBarMap = nullptr; }
     if (dspBarMap) { dspBarMap->release(); dspBarMap = nullptr; }
     if (pciDevice) { pciDevice->release(); pciDevice = nullptr; }
@@ -1026,6 +1277,35 @@ bool LatSOFAudioDevice::initDSP() {
             }
         }
 
+        // review 1 Aug round 4: the preflight classified this descriptor
+        // >=750 ms ago (settle + firmware waits) — AppleHDA may have begun
+        // playback since. Re-classify at the last instant BEFORE the
+        // snapshot, shrinking the check-to-use window to microseconds.
+        // RUN always bails (the instant-loud-static case); a PROGRAMMED
+        // descriptor bails only while borrow patience remains — once the
+        // retry engine has decided borrow-anyway (patience exhausted),
+        // passing it here is what keeps the mic recoverable at all, since
+        // SD7 stays programmed forever after AppleHDA's first playback.
+        //
+        // Placed before the snapshot deliberately: `goto cleanup` then frees
+        // fwBuf/bdlBuf and re-masks the DSP interrupts like every other exit,
+        // while sdRestore no-ops on the still-invalid snapshot — so the bail
+        // writes NOTHING to a descriptor that is not ours. (Bailing after the
+        // snapshot would either leak both firmware buffers or, via cleanup,
+        // run streamReset on AppleHDA's live stream: the exact harm this
+        // check exists to prevent.)
+        {
+            int st2 = outputSdBusyState(hda);
+            if (st2 == 1 || (st2 == 2 && gStrictBorrow &&
+                             gProgrammedWaits <= kProgrammedWaitRounds)) {
+                gWakeReinitPending = true;
+                setProperty("Status", "deferred: output became busy before borrow");
+                IOLog("LatSOF: output became %s between preflight and borrow "
+                      "— deferring\n", (st2 == 1) ? "RUNNING" : "programmed");
+                goto cleanup;
+            }
+        }
+
         // PPCTL: PIE + GPROCEN + decouple the loader streams.
         // LATITUDE FORK: the reference also set (1U << capIdx) here, relying
         // on the member's constructor value — capIdx isn't assigned until
@@ -1403,7 +1683,12 @@ bool LatSOFAudioDevice::initDSP() {
                     if (capDmaBuf) capDmaBuf->prepare();
                 }
                 if (capDmaBuf) bzero(capDmaBuf->getBytesNoCopy(), kLatSOF_CapBufferSize);
-                if (!capBdlBuf) {
+                // review 1 Aug: BDL only if the ring exists — a lone capBdlBuf
+                // (ring alloc failed) could never be repaired by a later
+                // initDSP (its !capBdlBuf guard skips the fill), and capture
+                // would arm against all-zero BDL entries. Keeping the pair
+                // atomic lets the next initDSP rebuild both.
+                if (!capBdlBuf && capDmaBuf) {
                     UInt32 numBdl = (kLatSOF_CapBufferSize + PAGE_SIZE - 1) / PAGE_SIZE;
                     UInt32 bdlSz = ((numBdl * 16) + 127) & ~127U;
                     capBdlBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
@@ -1473,7 +1758,12 @@ setProperty("Status", "Ready for UserClient"), IOLog("LatSOF: %s\n", "Ready for 
         // to the borrowed descriptor. SD-Final must match SD-Borrow field for
         // field; if it ever doesn't, something wrote SD7 after the hand-back
         // and that is the bug — no inference needed.
-        { char f[128];
+        // Only meaningful when we actually borrowed. The round-4 bail (output
+        // went busy between preflight and borrow) reaches this label with an
+        // invalid snapshot having written nothing — publishing SD-Final there
+        // would invite a field-for-field comparison against a STALE SD-Borrow
+        // and read as a contract violation that never happened.
+        if (snap.valid) { char f[128];
           snprintf(f, sizeof(f),
                    "sd%d ctl=0x%06x fmt=0x%04x bdl=0x%08x cbl=%u lvi=%u ppctl=0x%08x spiben=0x%08x",
                    sIdx, rd32(hda, sd) & 0x00FFFFFF, rd16(hda, sd + SD_REG_FMT),
@@ -1631,6 +1921,14 @@ void LatSOFAudioDevice::scheduleDspRecovery(const char *reason) {
     gWakeReinitPending = true;
     gWakeTries = 0;
     gWakeTickDivider = 0;
+    // patch-30a: patience is PER EPISODE, not per boot. Without this reset a
+    // recovery that follows an earlier one starts with zero patience, borrows
+    // AppleHDA's programmed descriptor immediately, and the firmware load then
+    // fails — observed 29 Jul as 12 consecutive "FAILED: ROM IPC timeout" with
+    // SD-Borrow showing fmt=0x0031 bdl=0x2be41000, i.e. a stream that was very
+    // much in use. Every retry engine here refills its own budget; this one
+    // must too.
+    gProgrammedWaits = 0;
     setProperty("DSP-Recovery", reason);
     IOLog("LatSOF: DSP recovery scheduled: %s\n", reason);
 }
@@ -1658,16 +1956,21 @@ void LatSOFAudioDevice::shutdownForSleepGated() {
 IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) {
     if (powerStateOrdinal == 0) {
         // Sleep — use the fast path to prevent MMIO hang-on-sleep.
+        gSleptOnce = true;            // see the latch comment: real wakes only
         gWakeReinitPending = false;   // patch-22: cancel any retry round
         shutdownForSleepGated();
     } else {
-        // Wake — full re-init (skip if already running, e.g. initial PM registration)
+        gSleepImminent = false;   // round 4: unconditional — even on wakes
+                                  // that skip re-init below
+        // Wake — full re-init. gSleptOnce keeps this off the initial PM
+        // registration, including the patch-30 deferred-load case where
+        // hwReady is legitimately still false at registration time.
         // patch-26: do NOT require hdaBase/dspBase here. A failed remap on a
         // previous wake nulls them, and the only code that can repair them is
         // the remap block inside this very branch — gating on the pointers
         // turned one transient remap failure into a driver that was dead
         // until reboot, while its own comment promised "next wake retries".
-        if (!hwReady && pciDevice) {
+        if (!hwReady && pciDevice && gSleptOnce) {
             // PCI power cycle
             pciDevice->setBusMasterEnable(true);
             pciDevice->setMemoryEnable(true);
@@ -1708,6 +2011,38 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
             gWakeTries = 0;
             gWakeTickDivider = 0;
             gRecoveryEpisodes = 0;   // patch-27b: each wake grants a fresh budget
+            gProgrammedWaits  = 0;   // patch-30a: and a fresh borrow patience
+            // review 1 Aug: like every other retry engine here. A wake cycle
+            // that skips resumeAudioEngine (engine parked in Resumed after a
+            // failed attempt — family only pauses Running engines) would
+            // otherwise run on the previous cycle's leftover tries.
+            gEngineResumeTries = 0;
+            // review 1 Aug round 2: and an EXHAUSTED latch must be re-armed
+            // here, or a still-held session is dead forever — once parked in
+            // Resumed, no later sleep/wake generates a resumeAudioEngine
+            // call to re-latch it (family pauses only Running engines).
+            // Same philosophy as gWasCapturing surviving a failed re-arm.
+            // Self-healing if over-eager: completeDeferredResume no-ops on
+            // Running or clientless engines and the executor clears the latch.
+            if (!gEngineResumePending && kernelAudio) {
+                LatSOFKernelAudioEngine *e = kernelAudio->getEngine();
+                if (e && e->needsDeferredResume()) {
+                    gEngineResumePending = true;
+                    // round 4: split the telemetry — Resumed is the genuinely
+                    // parked anomaly (no family resume will ever come for
+                    // it); Paused here is just a normal held-session wake
+                    // latched ahead of the family's own resume.
+                    if (e->getState() == kIOAudioEngineResumed) {
+                        setProperty("Engine-Resume", "re-latched at wake (parked)");
+                        IOLog("LatSOF: %s\n",
+                              "parked session found at wake — re-latching resume");
+                    } else {
+                        setProperty("Engine-Resume", "latched at wake");
+                        IOLog("LatSOF: %s\n",
+                              "held session at wake — latching ahead of family resume");
+                    }
+                }
+            }
             setProperty("Wake-Retry", "scheduled");
         }
     }
@@ -1727,10 +2062,19 @@ IOReturn LatSOFAudioDevice::setPowerState(unsigned long powerStateOrdinal, IOSer
 // hook to pre-mute while userspace is still alive, minimising the audible
 // DMA-loop window.
 void LatSOFAudioDevice::handleWillSleepGated() {
+    gSleepImminent = true;   // round 4: park the resume executor (see latch)
     fastMute();
 }
 IOReturn LatSOFAudioDevice::s_handleWillSleep(OSObject *o, void *, void *, void *, void *) {
     static_cast<LatSOFAudioDevice *>(o)->handleWillSleepGated();
+    return kIOReturnSuccess;
+}
+
+// See sPowerInterestHandler: the sleep-parking latch must not survive a
+// sleep that never happened.
+IOReturn LatSOFAudioDevice::s_handleWakeNotice(OSObject *o, void *, void *, void *, void *) {
+    (void)o;
+    gSleepImminent = false;
     return kIOReturnSuccess;
 }
 
@@ -1747,6 +2091,17 @@ IOReturn LatSOFAudioDevice::sPowerInterestHandler(void *target, void *refCon,
     if (!self) return kIOReturnSuccess;
     if (messageType == kIOMessageSystemWillSleep) {
         if (self->commandGate) self->commandGate->runAction(&s_handleWillSleep);
+    } else if (messageType == kIOMessageSystemWillPowerOn ||
+               messageType == kIOMessageSystemHasPoweredOn ||
+               messageType == kIOMessageSystemWillNotSleep) {
+        // review 1 Aug round 4 (self-review): gSleepImminent is set by the
+        // non-vetoable WillSleep and cleared in setPowerStateGated's wake
+        // arm — but an ABORTED sleep (a driver failing setPowerState, seen
+        // on this machine 29 Jul 10:32) returns the system to running
+        // without ever delivering our power-state pair, which would park the
+        // resume executor for the rest of the session. These messages arrive
+        // on every real wake and on every abort, so clearing here closes it.
+        if (self->commandGate) self->commandGate->runAction(&s_handleWakeNotice);
     } else if (messageType == kIOPMMessageClamshellStateChange) {
         // arg bitfield: bit 0 (kClamshellStateBit) = clamshell closed.
         if (self->commandGate) {
@@ -1770,10 +2125,18 @@ void LatSOFAudioDevice::stop(IOService *provider) {
     // kernel-mic: tear the audio device down first, while the workloop and
     // gated capture paths are fully alive — its engine stop calls
     // engineStopCapture, which must find working machinery.
+    // review 1 Aug round 3: publish the null UNDER the gate before
+    // terminating. PM can still deliver a gated setPowerState until PMstop
+    // (see the patch-26 comment below), and the wake re-latch dereferences
+    // kernelAudio->getEngine() from that path — an off-gate teardown here
+    // was a use-after-free window. After the gated null, an in-flight gated
+    // reader has either finished (object fully alive) or sees nullptr.
     if (kernelAudio) {
-        kernelAudio->terminate(kIOServiceSynchronous);
-        kernelAudio->release();
-        kernelAudio = nullptr;
+        LatSOFKernelAudioDevice *ka = kernelAudio;
+        if (commandGate) commandGate->runAction(&s_clearKernelAudio);
+        else kernelAudio = nullptr;
+        ka->terminate(kIOServiceSynchronous);
+        ka->release();
     }
 
     // patch-26: stop our streams BEFORE PMstop. PMstop synchronously
@@ -1822,12 +2185,48 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
     if (gWakeReinitPending && !hwReady && pciDevice && hdaBase && dspBase) {
         if (++gWakeTickDivider >= 3) {            // one attempt per ~1.5 s
             gWakeTickDivider = 0;
-            bool busy = false;
-            UInt16 g = rd16(hdaBase, HDA_GCAP);
-            bool decoding = (g != 0xFFFF && g != 0x0000);
-            if (decoding) {
-                UInt32 outSd = SD_BASE + (UInt32)((g >> 8) & 0xF) * SD_SIZE;
-                if (rd8(hdaBase, outSd) & SD_CTL_RUN) busy = true;  // AppleHDA playing — wait our turn
+            // patch-30: RUN alone is not enough. Measured 29 Jul: at a
+            // wake this borrowed SD7 while it read
+            //   ctl=0x140000 fmt=0x0031 bdl=0x2907a000 cbl=393216 lvi=95
+            // — RUN CLEAR but fully PROGRAMMED by AppleHDA. The loader
+            // resets that descriptor, uses it, and restores the registers
+            // byte-for-byte, but a stream's FIFO and DMA position are not
+            // register state and cannot be handed back. AppleHDA then
+            // plays into a descriptor whose internals we scrubbed, and
+            // never reprograms it — persistent output static that even
+            // replugging the jack does not clear. Only a reboot did.
+            //
+            // So a programmed descriptor also means "not ours to take".
+            // It cannot mean "wait forever", though: AppleHDA leaves SD7
+            // programmed after its first playback, so an unbounded wait
+            // would mean no microphone for the rest of the session. Wait
+            // a bounded number of rounds for a genuinely clean window,
+            // then take it anyway — a mic that works with a risk of
+            // static beats a mic that never comes back.
+            //
+            // Classification comes from outputSdBusyState — the same
+            // predicate the load path uses, so the two cannot disagree.
+            // Patience and borrow-anyway POLICY stay here; the helper only
+            // answers "what state is the descriptor in".
+            UInt16 g = 0;
+            int st = outputSdBusyState(hdaBase, &g);
+            bool decoding = (st != -1);
+            bool busy = (st == 1), programmed = false;
+            if (!busy && decoding && gStrictBorrow) {
+                if (st == 2) {
+                    if (++gProgrammedWaits <= kProgrammedWaitRounds) {
+                        programmed = true;
+                        busy = true;              // defer this round
+                    } else if (gProgrammedWaits >= kProgrammedWaitRounds + 1) {
+                        setProperty("Borrow-Warning",
+                            "SD7 still programmed after wait — borrowing anyway");
+                        IOLog("LatSOF: SD7 still programmed after %d rounds; "
+                              "borrowing anyway (playback may glitch)\n",
+                              kProgrammedWaitRounds);
+                    }
+                } else {
+                    gProgrammedWaits = 0;         // clean window — reset patience
+                }
             }
             // patch-26: only a real init attempt consumes the retry budget.
             // gWakeTries++ used to run before the busy check, so music
@@ -1837,9 +2236,10 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
             // preflight is two register reads per 1.5 s, and the first quiet
             // moment gets a genuine attempt.
             if (decoding && !busy) gWakeTries++;
-            { char w[64];
-              snprintf(w, sizeof(w), "n=%d gcap=0x%04x %s",
-                       gWakeTries, g, busy ? "busy" : (decoding ? "try" : "nodecode"));
+            { char w[80];
+              snprintf(w, sizeof(w), "n=%d gcap=0x%04x %s", gWakeTries, g,
+                       programmed ? "deferred: SD7 programmed"
+                                  : (busy ? "busy" : (decoding ? "try" : "nodecode")));
               setProperty("Wake-Retry", w); }
             if (!busy && decoding && initDSP()) {
                 gWakeReinitPending = false;
@@ -1871,6 +2271,160 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
                 // stopCaptureGated clears the latch on any explicit stop.
                 setProperty("Wake-Retry-Done", "GAVE UP after 12 tries"),
                     IOLog("LatSOF: %s\n", "wake re-init gave up after 12 tries");
+                // review 1 Aug: make the terminal state self-describing.
+                // Without this the last initDSP attempt's bare "FAILED: …"
+                // string is what §2's post-install gate sees, and that gate
+                // says "roll back" — wrong advice when the real story is
+                // "12 attempts exhausted in a busy/hot-load environment".
+                setProperty("Status",
+                            "FAILED: DSP init retries exhausted (see Wake-Retry-Done)");
+            } else if (decoding && !busy) {
+                // review 1 Aug round 2: an attempt RAN and FAILED with budget
+                // remaining (initDSP just wrote a bare "FAILED: …" Status).
+                // Left standing, that string tells the §2 gate to roll back a
+                // build that is mid-retry. Rewrap it as in-progress; keep the
+                // reason when it is a fresh initDSP failure string. Fires only
+                // on a ran-and-failed event, never on busy/deferred ticks.
+                OSString *s = OSDynamicCast(OSString, getProperty("Status"));
+                const char *prev = s ? s->getCStringNoCopy() : nullptr;
+                char st2[96] = "";
+                if (prev && strncmp(prev, "FAILED", 6) == 0)
+                    snprintf(st2, sizeof(st2), "deferred: retrying after %s (%d/12)",
+                             prev, gWakeTries);
+                else if (!prev || strncmp(prev, "deferred", 8) != 0)
+                    snprintf(st2, sizeof(st2), "deferred: init attempt %d/12 failed — retrying",
+                             gWakeTries);
+                // already "deferred: …" (e.g. the borrow-time re-check's own
+                // string) — leave it, it is self-describing
+                if (st2[0]) setProperty("Status", st2);
+            }
+        }
+    }
+    // patch-30 fix 1 executor. Placed BEFORE the i2cBase bail-out below —
+    // i2cBase is permanently null on this board (initI2C returns early), so
+    // nothing after that line ever runs. Preflight mirrors the capture
+    // re-arm: only act once the rebuild has verifiably succeeded. A failed
+    // start schedules its own DSP recovery (both capture-start timeout paths
+    // do), which drops hwReady and parks the latch until the rebuild — the
+    // bounded tries only spend on attempts that ran and failed. EXCEPT when
+    // gRecoveryEpisodes is exhausted: scheduleDspRecovery then returns
+    // without dropping hwReady, no rebuild is coming, and retrying at tick
+    // rate would stall the workloop ~1 s per attempt for nothing — treat
+    // that as terminal immediately (the next wake refills the episode
+    // budget AND re-latches a parked session, so nothing is lost).
+    // review 1 Aug rounds 3+4: park the executor across sleep entry.
+    // kernelAudio is our PM child, so at sleep entry it pauses the engine
+    // BEFORE our own setPowerState(0) drops hwReady — a latch executed in
+    // that gap would drain the family's SLEEP pause and start capture DMA
+    // microseconds before D3. gSleepImminent is the authoritative signal
+    // (gated WillSleep, precedes all of it); the family reads are TOCTOU
+    // belts only — pendingPowerState is written before the pause loop,
+    // currentPowerState covers the wake-completion window. Parked, the
+    // latch survives to wake, where budget-refill + re-latch complete it.
+    if (gEngineResumePending && hwReady && !gWakeReinitPending && !gSleepImminent &&
+        kernelAudio &&
+        kernelAudio->getPowerState() != kIOAudioDeviceSleep &&
+        kernelAudio->getPendingPowerState() != kIOAudioDeviceSleep) {
+        LatSOFKernelAudioEngine *e = kernelAudio->getEngine();
+        if (!e) {
+            gEngineResumePending = false;
+        } else {
+            const char *outcome = "idle";
+            IOReturn rr = e->completeDeferredResume(&outcome);
+            if (rr == kIOReturnSuccess) {
+                gEngineResumePending = false;
+                setProperty("Engine-Resume", outcome);
+                if (!strcmp(outcome, "restarted"))
+                    IOLog("LatSOF: %s\n", "engine restarted after resume");
+            } else if (++gEngineResumeTries >= kEngineResumeMaxTries ||
+                       gRecoveryEpisodes > 3) {
+                gEngineResumePending = false;
+                setProperty("Engine-Resume", (gRecoveryEpisodes > 3)
+                            ? "gave up (recovery exhausted)" : "gave up");
+                IOLog("LatSOF: engine resume gave up after %d tries (last=0x%x%s)\n",
+                      gEngineResumeTries, rr,
+                      (gRecoveryEpisodes > 3) ? ", recovery exhausted" : "");
+            } else {
+                IOLog("LatSOF: engine resume attempt %d/%d failed (0x%x) — will retry\n",
+                      gEngineResumeTries, kEngineResumeMaxTries, rr);
+            }
+        }
+    }
+    // patch-31: AFG keep-alive (see the block comment at iciVerb). MMIO-only
+    // detection; codec verbs only on an engine (re)build or the slow RUN
+    // belt. Runs even while !hwReady would be wrong — the OUTPUT side is
+    // AppleHDA's and lives regardless of our DSP state — needs only hdaBase.
+    //
+    // REVIEW FIX (2 Aug): the first cut triggered on clean->armed only. But
+    // AppleHDA leaves SD7 PROGRAMMED after its first playback (patch-30's
+    // own measurement), so the descriptor never reads clean again and every
+    // later idle-plug rebuild is programmed->programmed — invisible to a
+    // 3-state classifier, leaving only the 10 s belt. The rebuild is still
+    // MMIO-visible, though: it rewrites BDL/CBL/FMT. So the trigger is any
+    // change in the descriptor SIGNATURE (bdl^cbl^fmt) or state class while
+    // armed/RUN — which fires at plug time, before playback starts (the
+    // pre-arm), and again at RUN start as the belt-and-braces.
+    if (gAfgKextWake && hdaBase && gAfgIciFails < kAfgIciFailLimit) {
+        UInt16 g = 0;
+        int sd = outputSdBusyState(hdaBase, &g);
+        bool rebuild = false;
+        if (sd >= 0) {
+            UInt32 outSd = SD_BASE + (UInt32)((g >> 8) & 0xF) * SD_SIZE;
+            UInt32 sig = rd32(hdaBase, outSd + SD_REG_BDLPL)
+                       ^ rd32(hdaBase, outSd + SD_REG_CBL)
+                       ^ ((UInt32)rd16(hdaBase, outSd + SD_REG_FMT) << 1);
+            rebuild = (sd > 0) && (sd != gAfgLastSd || sig != gAfgLastSig);
+            gAfgLastSd = sd;
+            gAfgLastSig = sig;
+        }
+        bool belt = (sd == 1 && ++gAfgBeltTick >= kAfgBeltTicks);
+        if (belt || rebuild) gAfgBeltTick = 0;
+
+        // PRE-ARM on the jack itself. Only while the output is not already
+        // RUNning — during playback the descriptor path above covers us and
+        // this would be pointless codec traffic. One verb per ~1 s at idle,
+        // and iciVerb bails on contention, so AppleHDA is never blocked.
+        bool jackIn = false;
+        if (sd != 1 && ++gAfgSenseTick >= kAfgSenseTicks) {
+            gAfgSenseTick = 0;
+            UInt32 sense = 0;
+            if (iciVerb(hdaBase, kVerbGetPinSense, &sense)) {
+                bool present = (sense & kPinPresent) != 0;
+                jackIn = present && !gAfgJackWasIn;   // absent -> present
+                gAfgJackWasIn = present;
+            }
+        }
+        if (rebuild || belt || jackIn) {
+            UInt32 ps = 0;
+            if (iciVerb(hdaBase, kVerbGetPower, &ps)) {
+                gAfgIciFails = 0;
+                // Publish the FIRST successful read even when no correction
+                // is needed. Absence of any AFG-* property must mean "the
+                // code never ran", never "it ran and silently did nothing" —
+                // that ambiguity is what hid the NID bug in the first cut.
+                if (!gAfgProbed) {
+                    gAfgProbed = true;
+                    char pb[48];
+                    snprintf(pb, sizeof(pb), "ICI ok, AFG=0x%08x (D%u)",
+                             (unsigned)ps, (unsigned)((ps >> 4) & 0xF));
+                    setProperty("AFG-Probe", pb);
+                    IOLog("LatSOF: AFG probe via ICI: 0x%08x\n", (unsigned)ps);
+                }
+                if ((ps & 0xF0) != 0) {          // ACTUAL state (bits 7:4) != D0
+                    iciVerb(hdaBase, kVerbSetPowerD0, nullptr);
+                    gAfgWakes++;
+                    setProperty("AFG-Wake", gAfgWakes, 32);
+                    IOLog("LatSOF: AFG was D%u at %s — forced D0 (wake #%u)\n",
+                          (unsigned)((ps >> 4) & 0xF),
+                          jackIn ? "jack insert (pre-arm)" : (rebuild ? "engine rebuild" : "belt check"),
+                          (unsigned)gAfgWakes);
+                }
+            } else if (++gAfgIciFails >= kAfgIciFailLimit) {
+                // ICI unusable on this controller: retire, loudly — the
+                // userland daemon is then load-bearing again.
+                setProperty("AFG-Wake", "ICI unavailable — keep the daemon");
+                IOLog("LatSOF: %s\n",
+                      "AFG wake retired: ICI never responded; keep latsof-afgwake");
             }
         }
     }
@@ -2317,6 +2871,10 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
     // where the recording app quits during the retry window: its StopCapture
     // no-ops on isCapturing below, but without this line the stale latch
     // would later re-arm DMA for a session nobody holds.
+    // patch-30: one caller is NOT final intent — the family's pauseAudioEngine
+    // (via engineStopCapture) promises a resume. That case is covered by the
+    // engine-resume latch (engineRequestResume), not by gWasCapturing, so
+    // clearing here stays correct for every caller.
     gWasCapturing = false;
     if (!isCapturing) return kIOReturnSuccess;
 
@@ -2461,6 +3019,51 @@ IOReturn LatSOFAudioDevice::engineStartCapture() {
 }
 void LatSOFAudioDevice::engineStopCapture() {
     if (commandGate) commandGate->runAction(&s_stopCapture);
+}
+
+// patch-30 fix 1: latch only — never a synchronous restart. resumeAudioEngine
+// arrives on the family PM path seconds before jackPoll's retry engine has
+// rebuilt the DSP; a start issued here would fail NotReady and burn the one
+// restart the session gets. jackPoll executes the latch once hwReady is back
+// (same shape as the gWasCapturing re-arm, which covers the UserClient world;
+// this covers the family world, whose pause cleared isCapturing before the
+// sleep latch-OR could see it).
+IOReturn LatSOFAudioDevice::s_engineRequestResume(OSObject *o, void *, void *, void *, void *) {
+    auto *self = static_cast<LatSOFAudioDevice *>(o);
+    gEngineResumePending = true;
+    gEngineResumeTries = 0;
+    self->setProperty("Engine-Resume", "latched");
+    return kIOReturnSuccess;
+}
+void LatSOFAudioDevice::engineRequestResume() {
+    if (commandGate) commandGate->runAction(&s_engineRequestResume);
+}
+
+// review 1 Aug round 3: teardown handshake with the kernel audio child. The
+// child's engine pointer is unretained and the family frees the engine in
+// IOAudioDevice::stop — these gated actions make every later gated reader
+// (wake re-latch, jackPoll executor) see nullptr instead of freed memory.
+// s_clearKernelAudio additionally covers the owner's own stop(): publishing
+// kernelAudio = nullptr under the gate before terminate closes the window
+// where a PM setPowerState (deliverable until PMstop) races the teardown.
+IOReturn LatSOFAudioDevice::s_kernelAudioTeardown(OSObject *o, void *a0, void *, void *, void *) {
+    (void)o;
+    auto *d = (LatSOFKernelAudioDevice *)a0;
+    gEngineResumePending = false;    // no engine left to resume
+    if (d) d->clearEngine();
+    return kIOReturnSuccess;
+}
+void LatSOFAudioDevice::kernelAudioTearingDown(LatSOFKernelAudioDevice *d) {
+    if (commandGate) {
+        commandGate->runAction(&s_kernelAudioTeardown, d);
+    } else {
+        gEngineResumePending = false;
+        if (d) d->clearEngine();
+    }
+}
+IOReturn LatSOFAudioDevice::s_clearKernelAudio(OSObject *o, void *, void *, void *, void *) {
+    static_cast<LatSOFAudioDevice *>(o)->kernelAudio = nullptr;
+    return kIOReturnSuccess;
 }
 IOReturn LatSOFAudioDevice::stopCapture() {
     if (!commandGate) return kIOReturnNotReady;
