@@ -200,6 +200,23 @@ Fix with `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`.
 
 ## Headphone crackle (not a microphone problem, but read this)
 
+> **2 Aug 2026 — this whole class of fault is now fixed structurally, and
+> everything below survives as history and as a field guide for other
+> machines.** The reference machine runs a custom AppleALC layout
+> (`alcid=92`, built by `contrib/alc236-layout91-rebuild.sh`) that sets
+> `MinimumSampleRate = 48000` on the output-path nodes. AppleHDA then never
+> *publishes* 44.1 kHz — verified by disassembling `AppleHDAPath::
+> isAudioStreamSupported` in the running kernel collection — so CoreAudio
+> cannot select it: no stuck cold boots, no rate roulette on replug, and
+> call apps physically cannot drag the output down. No resident enforcer,
+> nothing to keep running. `latsof-setrate` remains useful only as a
+> one-shot *diagnostic* on machines still running a stock layout.
+>
+> A second, rarer static — a jack event landing on an idle engine — turned
+> out to be an entirely different fault (the codec's Audio Function Group
+> left powered down by AppleHDA) and is fixed inside the kext itself; see
+> `DEBUGGING-LOG.md`.
+
 Static or crackling from the 3.5 mm jack on ALC laptops is almost always the
 classic **44.1 kHz problem**: set the output to **48,000 Hz** in Audio MIDI
 Setup.

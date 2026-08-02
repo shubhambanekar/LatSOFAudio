@@ -43,13 +43,22 @@ from it.
   just the one in the init path.
 - **Stream-descriptor partitioning.** GCAP `0x9701` advertises 7 input and 9
   output DMA engines, so SD0–SD6 are input descriptors and SD7–SD15 output.
-  AppleHDA captures on SD0. This driver captures on input descriptor **SD1
-  with stream tag 2**, which is exclusively ours for the driver's lifetime.
-  It also **borrows SD7 — AppleHDA's first output engine — for the duration
-  of every firmware load**, because the DSP code loader has to run over an
-  output descriptor. That borrow is the most dangerous thing this driver
-  does; see "The borrowed-stream contract" below.
-- **Per-stream decoupling only.** `PPCTL` is written to decouple SD1 into
+  This driver captures on input descriptor **SD6 with stream tag 7** — the
+  *last* input descriptor, deliberately. It originally sat on SD1 ("SD0 is
+  AppleHDA's"), which was safe while AppleHDA published a single input
+  engine. The moment the layout publishes more — the reference machine's
+  layout 92 publishes two — selecting the second one runs a **real DMA
+  stream even though its codec pin is dead**, on the next free input
+  descriptor, straight over a capture ring parked on SD1. Field failure
+  (2 Aug 2026): input switched to the dead "Line In" and back → capture
+  stop IPC timed out → mic dead until sleep. AppleHDA allocates input
+  streams from the bottom, so SD6 collides only if seven input engines run
+  at once. The driver also **borrows SD7 — AppleHDA's first output
+  engine — for the duration of every firmware load**, because the DSP code
+  loader has to run over an output descriptor. That borrow is the most
+  dangerous thing this driver does; see "The borrowed-stream contract"
+  below.
+- **Per-stream decoupling only.** `PPCTL` is written to decouple SD6 into
   DSP mode exactly once at capture start, and it is re-coupled at stop.
   Bit 0 (AppleHDA's SD0) is never touched. An early version of this code
   applied the decouple with an uninitialised index — decoupling SD0 on
@@ -598,6 +607,49 @@ ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "SD-Borrow|SD-Final"
 
 If those two ever disagree, something wrote SD7 after the hand-back, and the
 differing field names it. No inference required.
+
+## The AFG keep-alive (patch-31)
+
+The one place this driver deliberately talks to the *codec* rather than the
+DSP. AppleHDA drops the ALC236's Audio Function Group (node `0x01`) to D3
+when the output engine idles and — on the idle-jack-insert path — starts
+streaming without restoring it. Since the AFG is the parent of every widget,
+the headphone pin and DAC then sit at "requested D0, actually D3" and audio
+drives a powered-down chain: harsh static that only a replug (a full
+re-init) cured. Measured by diffing codec dumps: the static and clean states
+differ *only* in those power states; pin control, EAPD, amp gains, routing
+and format are byte-identical.
+
+The correction is one verb, `SET_POWER_STATE D0` to node `0x01` — idempotent
+and monotonic, so it can never leave two pieces of state disagreeing. What
+matters is the transport and the trigger:
+
+- **Transport: the Immediate Command Interface** (`ICOI/IRII/ICIS` at
+  `0x60/0x64/0x68`), *not* CORB/RIRB. The command ring belongs to AppleHDA,
+  and contending on it is the same shared-resource bet the borrowed-stream
+  contract exists to manage. ICI is a separate, controller-arbitrated path:
+  claim only when idle, bound every wait (~1 ms), bail silently on
+  contention. If ICI never responds, the code retires itself after 8
+  failures and publishes `AFG-Wake = "ICI unavailable"` rather than
+  guessing (a userland fallback, `contrib/latsof-afgwake.c`, does the same
+  job through AppleALC's user client).
+- **Triggers, all MMIO-detected from jackPoll's 500 ms tick.** Three, each
+  the product of a failed hardware round: (1) any change of SD7's
+  BDL^CBL^FMT *signature* — an engine rebuild, which a state-class watcher
+  misses because AppleHDA leaves SD7 programmed forever after first
+  playback; (2) the headphone pin's jack-sense bit (`GET_PIN_SENSE 0x21`,
+  polled only while the output is idle) — the plug itself, which SD7 cannot
+  reveal at all since AppleHDA doesn't touch it until playback starts, by
+  which time the fault is already audible; (3) a slow belt check while
+  RUNning. Steady idle generates zero codec traffic and D3 is left alone —
+  it is the correct state there, and fighting AppleHDA's idle policy is
+  exactly what this driver's history warns against.
+- **Verb encoding is built by macro** (`kHdaVerb(nid, verb, payload)`),
+  because the first cut hand-wrote the words without the NID field, silently
+  addressed node 0x00 (root), read the answer 0 as "already D0", and never
+  fired. `AFG-Probe` publishes the first successful read even when nothing
+  needs correcting, so "never ran" can never again be mistaken for "ran and
+  found nothing".
 
 ## What was measured
 
