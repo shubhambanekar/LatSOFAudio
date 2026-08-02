@@ -34,5 +34,5 @@ launchctl list 2>/dev/null | grep -i afgwake || echo "afgwake agent not loaded"
 
 echo "\nNEXT: play on speakers -> plug headphones (listen) -> unplug 10s ->"
 echo "plug -> play (the idle case, listen). If static: run"
-echo "  ~/Desktop/latsof-attempt2/hp-codec-dump.sh 97-static    (while hissing!)"
+echo "  ~/Desktop/LatSOF/latsof-attempt2/hp-codec-dump.sh 97-static    (while hissing!)"
 echo "then revert alcid to 92 and reboot — the dump makes even a failure useful."

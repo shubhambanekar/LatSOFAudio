@@ -40,7 +40,7 @@
 #
 set -e
 W="$1"                      # workdir — REUSED across runs, see below
-OUT="$HOME/Desktop/latsof-attempt2"
+OUT="$HOME/Desktop/LatSOF/latsof-attempt2"
 mkdir -p "$W" && cd "$W"
 
 # BE KIND TO THE MACHINE. Learned the hard way on 1 Aug: this build drove the

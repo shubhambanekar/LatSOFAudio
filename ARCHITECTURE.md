@@ -561,7 +561,7 @@ on its own.
 So if you try a third time, move the tag with the descriptor or do not bother.
 Repeating the free-stream scan alone costs a dead mic and settles nothing. The
 failed source is kept outside the repo as
-`~/Desktop/latsof-attempt2/patch28-failed-attempt.cpp.bak`.
+`~/Desktop/LatSOF/latsof-attempt2/patch28-failed-attempt.cpp.bak`.
 
 **What patch 28 was trying to fix is still open.** Hot-loading the kext while
 AppleHDA is playing hijacks a running stream: `SD-Borrow` read `ctl=0x14001e`
