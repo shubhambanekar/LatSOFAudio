@@ -190,11 +190,50 @@ static bool any_device_running(void) {
     return running;
 }
 
-// A notification is only a hint to LOOK. Nothing is written unless the state
-// is wrong — see the header comment.
+// Pre-arm on a JACK event, before anything starts playing.
+//
+// Waiting for kAudioDevicePropertyDeviceIsRunningSomewhere is correct but
+// LATE: that property can only fire once IO has already begun, so the first
+// ~0.5 s is audibly driven through the D3 path before the correction lands
+// (measured 1 Aug). A jack insert happens seconds earlier, so powering the
+// AFG there means playback starts on an already-live path.
+//
+// This is the one write NOT gated on observing a wrong state, so it is worth
+// being explicit about why that is still safe. The rule this project learned
+// from the retracted rate-pinner is "never write into AppleHDA's
+// reprogramming window", and it exists because a rate write can leave the
+// stream and the codec disagreeing. SET_POWER_STATE D0 cannot: it is
+// idempotent and MONOTONIC — it only ever powers up, and there is no second
+// piece of state for it to fall out of sync with. It is also bounded to one
+// write per jack event, so we never sit in a loop fighting AppleHDA's idle
+// policy: if no playback follows, AppleHDA idles the AFG back to D3 and we
+// leave it there.
+static void prearm_for_jack(void) {
+    int before = power_actual(AFG_NID);
+    if (before <= 0) return;                    // already D0, or unreadable
+    if (codec_verb(AFG_NID, VERB_SET_POWER_STATE, PS_D0) < 0) return;
+    if (gVerbose) {
+        stamp();
+        printf("jack event with AFG in D%d -> pre-armed D0 before playback\n",
+               before);
+        fflush(stdout);
+    }
+}
+
+// A notification is only a hint to LOOK. Apart from the jack pre-arm above,
+// nothing is written unless the state is wrong — see the header comment.
 static OSStatus on_change(AudioObjectID obj, UInt32 n,
                           const AudioObjectPropertyAddress *addrs, void *ctx) {
-    (void)obj; (void)n; (void)addrs; (void)ctx;
+    (void)obj; (void)ctx;
+
+    bool jack = false;
+    for (UInt32 i = 0; i < n; i++) {
+        if (addrs[i].mSelector == kAudioDevicePropertyJackIsConnected ||
+            addrs[i].mSelector == kAudioDevicePropertyDataSource)
+            jack = true;
+    }
+
+    if (jack) prearm_for_jack();      // get ahead of the stream
     if (any_device_running()) correct_if_wrong();
     return noErr;
 }
@@ -228,6 +267,21 @@ static void listen_all(void) {
                     kAudioDevicePropertyDeviceIsRunningSomewhere,
                     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                 AudioObjectAddPropertyListener(list[i], &run, on_change, NULL);
+
+                // Jack signals — these arrive BEFORE playback starts, which is
+                // what removes the audible head of the fault. DataSource is the
+                // one this codec actually moves (ispk <-> hdpn); JackIsConnected
+                // is registered too because it is the semantically right one
+                // where a driver publishes it.
+                AudioObjectPropertyAddress jack = {
+                    kAudioDevicePropertyJackIsConnected,
+                    kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+                AudioObjectAddPropertyListener(list[i], &jack, on_change, NULL);
+
+                AudioObjectPropertyAddress src = {
+                    kAudioDevicePropertyDataSource,
+                    kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+                AudioObjectAddPropertyListener(list[i], &src, on_change, NULL);
             }
         }
         free(list);
