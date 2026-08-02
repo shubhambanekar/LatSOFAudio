@@ -741,7 +741,7 @@ Microphone dead. Treat the free-stream approach as a dead end: on this hardware
 the ROM code loader wants `SD(numISS)` — the first *output* descriptor — and the
 freedom of the descriptor bought nothing. Reverted to the committed build (md5
 `90563e1c`, UUID `24E00A16`); the failed source is kept **outside** the repo at
-`~/Desktop/latsof-attempt2/patch28-failed-attempt.cpp.bak` so the next person
+`~/Desktop/LatSOF/latsof-attempt2/patch28-failed-attempt.cpp.bak` so the next person
 can read it instead of re-deriving it. Cost: a microphone outage and three
 reboots.
 

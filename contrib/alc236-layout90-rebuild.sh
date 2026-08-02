@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -e
 W="$1"                      # volatile workdir
-OUT="$HOME/Desktop/latsof-attempt2"
+OUT="$HOME/Desktop/LatSOF/latsof-attempt2"
 mkdir -p "$W" && cd "$W"
 rm -rf AppleALC Lilu MacKernelSDK
 git clone -q --depth 30 https://github.com/acidanthera/AppleALC.git
