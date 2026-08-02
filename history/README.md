@@ -26,6 +26,13 @@ to achieve and which attempts failed; this is the condensed index.
 | 24 | The actual fix: the borrowed-stream contract - snapshot once, restore once through an idempotent function called from every exit path, and verify with `SD-Final` read after the last write rather than `SD-Return` written before it |
 | 25 | Removed the one remaining `GCTL` reset (`shutdownDSPGated`'s teardown of shared BAR0 registers) and made the playback selectors refuse - on this board any StartPlayback was guaranteed to time out into exactly that reset |
 | 26 | Post-fix audit rounds, all failure-path bugs: the interrupt mask from 24 sat above the `cleanup:` label so every timeout path exited with the shared line armed; busy preflights consumed the 12-try wake budget (~18 s of playback at wake = mic dead until next sleep); the capture re-arm latch was lost on back-to-back sleeps; a failed BAR remap disabled the driver until reboot while claiming the next wake would retry. A second verification round then caught the first round's own regression - a StartCapture refused during the not-ready wake window was swallowed forever once StopIO cleared the latch, so a refused start now latches the demand - plus capture-start timeout paths that leaked RUN/PPCTL state, and `stop()` stream-stop guards that sat after the PMstop that cleared them |
+| 27 | DSP self-recovery: a capture IPC timeout now declares the DSP dead and hands rebuild to the wake retry engine — the field failure was WebRTC clients desyncing the firmware's PCM state with rapid open/close cycles |
+| 27b | Recovery episodes bounded to 3 - without the cap, a rebuild that "succeeded" against a dead mailbox re-entered recovery forever, blocking the workloop ~8.5 s of every 10 |
+| 28 | The free-stream experiment: scan for an unused output descriptor instead of borrowing SD7. The scan worked; the firmware then refused to load at all. The SOF loader requires SD(numISS). Reverted, source kept as evidence |
+| 29 | Edge-locked clock: DPIB advances in a ~1 ms staircase, so a random-instant read under-reports the write head (17.84 frames RMS vs AppleHDA's 0.37). Spin for the staircase edge, pair it with a bracketed clock read, discard preempted samples. Plus: a spurious-wrap fix (position reads 0 while the DSP is down) and a free-running timeline through DSP-down windows |
+| 30 | The two sleep asymmetries: IOAudioFamily resumes without ever calling performAudioEngineStart, and the family's own pause cleared the wake latch - a held session now restarts via a deferred latch that jackPoll completes after the rebuild verifiably succeeds. The load path gained the RUN-bit preflight it always lacked. Five adversarial review rounds fixed 23 defects here before first boot, including a use-after-free in kext-unload teardown |
+| 31 | The AFG keep-alive moved in-kernel: AppleHDA idles the codec's Audio Function Group to D3 and, on the idle-jack-insert path, streams without restoring it. One SET_POWER_STATE D0 over the Immediate Command Interface - not AppleHDA's CORB/RIRB. Three hardware rounds to get the triggers right; see DEBUGGING-LOG Phase 16 |
+| 32 | Capture moved SD1 → SD6: a dead codec pin does not mean a dead DMA engine, and layout 92's ghost inputs run real streams that landed on SD1. Plus: a refused capture start re-arms a given-up retry engine, and rebuilds carry hot/cold context - cold wakes borrow a programmed SD7 immediately, rebuilds under session churn wait for a clean window |
 
 The gap between 13 and 14 is the instructive part. 13 was a confident theory
 about clock drift that a profiler disproved in a single command; the real cause
@@ -41,5 +48,6 @@ the post-load path for *writes* instead of theorising about registers.
 time. Several of its "still to do" items were answered later - notably that the
 global `GCTL` reset turned out to be unnecessary, and that its plan to put the
 code loader on SD1 is not what happened: SD1 became the capture stream, and the
-loader runs on SD7, which is AppleHDA's. See "The borrowed-stream contract" in
-`ARCHITECTURE.md`.
+loader runs on SD7, which is AppleHDA's. SD1 later proved unsafe too, once the
+codec layout published a second AppleHDA input engine, and capture now lives on
+SD6 (entry 32). See "The borrowed-stream contract" in `ARCHITECTURE.md`.

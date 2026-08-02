@@ -121,7 +121,9 @@ One kext, two halves:
    it matches `IOResources` and locates the HDA controller by registry walk, so
    **AppleHDA keeps working** — speakers, headphones and AppleALC are
    untouched. The two drivers share the controller by partitioning stream
-   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2), with
+   descriptors (AppleHDA allocates input streams from the bottom; this driver
+   captures on **SD6, tag 7** — the highest input descriptor, out of reach of
+   however many input engines the codec layout publishes), with
    one carefully-managed exception: during each firmware load the code loader
    briefly borrows AppleHDA's first output descriptor and hands it back
    byte-identical (see the FAQ, and "The borrowed-stream contract" in
