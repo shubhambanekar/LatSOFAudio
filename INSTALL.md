@@ -428,10 +428,11 @@ means it had no work to do, not that it failed.
 > stays reproducible. Not from a LaunchAgent, not from a login item, not in a
 > terminal tab you leave open.
 >
-> Be warned that the comment block at the top of `contrib/latsof-setrate.c`
-> still recommends running `--watch` from a LaunchAgent with `KeepAlive`.
-> That comment predates the retraction and is wrong; this document overrides
-> it.
+> The comment block at the top of `contrib/latsof-setrate.c` agrees: it
+> documents `--watch` only as an alias, and closes with "No LaunchAgent, and
+> nothing to keep running." (Earlier revisions of this paragraph warned that
+> the source still recommended a `KeepAlive` LaunchAgent — that was true
+> before `2c677c6` and is no longer.)
 
 ### The cold-boot case, and its 20-second cure
 

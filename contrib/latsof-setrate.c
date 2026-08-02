@@ -13,6 +13,15 @@
 // (replug the jack, or sleep/wake). For the third, the rate change alone is the
 // whole fix, and --enforce automates it.
 //
+// SUPERSEDED ON THE REFERENCE MACHINE (2 Aug 2026). A custom AppleALC layout
+// carrying MinimumSampleRate = 48000 on the ALC236 output path (alcid=92,
+// built by contrib/alc236-layout91-rebuild.sh) makes 44.1 kHz *unpublishable*:
+// AppleHDAPath::isAudioStreamSupported treats the key as a hard gate, so none
+// of the three cases above can arise and there is nothing left for this tool
+// to correct. It is still the right tool on a stock layout, and still useful
+// with no argument to report the current rate. Do not install --enforce as a
+// LaunchAgent on a minrate layout — see INSTALL.md §7.
+//
 // Usage:
 //   latsof-setrate                    report the current rate and exit
 //   latsof-setrate 48000              pin once and exit
