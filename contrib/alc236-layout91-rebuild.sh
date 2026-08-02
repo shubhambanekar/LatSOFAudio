@@ -1,7 +1,21 @@
 #!/bin/zsh
 #
-# Build a custom AppleALC for the Latitude 3410 (ALC236) carrying THREE extra
-# layouts, switchable by boot-arg alone — no kext swap needed to A/B:
+# Build a custom AppleALC for the Latitude 3410 (ALC236) carrying FIVE extra
+# layouts, switchable by boot-arg alone — no kext swap needed to A/B.
+#
+# The input-strip has two independent halves, and 90/91 applied BOTH. Since
+# they hiss replug-proof at a verified 48 kHz while stock-based 92 does not,
+# one of the halves wakes an amp fault. 93 and 94 split them, so the 2x2 is:
+#
+#            layout XML keys | Platforms ADC paths | ghost mics | amp fault
+#   alcid=91     dropped     |      dropped        |    none    |   YES
+#   alcid=92     kept        |      kept           |  present   |   no
+#   alcid=93     dropped     |      kept           |     ?      |    ?
+#   alcid=94     kept        |      dropped        |     ?      |    ?
+#
+# If 93 or 94 removes the ghost mics without the amp fault, that is the ideal
+# config. All five carry the 48 kHz rate fix except 90, kept byte-identical
+# as the historical reference.
 #
 #   alcid=90  output-only fork of layout 15 (ghost codec inputs stripped) —
 #             unchanged from alc236-layout90-rebuild.sh, kept as the rollback
@@ -69,14 +83,16 @@ def add_minrate(x, acc):
 
 OUT_PATH_NODES = [20, 2, 33, 3]   # speaker pin<-DAC + headphone pin<-DAC
 
-# layout 92 first, from the UNTOUCHED stock layout (inputs intact) —
+# layouts that KEEP the stock layout XML (inputs intact): 92 and 94
 lay = load_frag('layout15.xml')
 lay['LayoutID'] = 92; dump_frag(lay, 'layout92.xml')
-# — then strip the ghost inputs (proven transform) and emit 90 and 91
+lay['LayoutID'] = 94; dump_frag(lay, 'layout94.xml')
+# — then strip the ghost inputs and emit the layouts that drop them
 for ref in lay['PathMapRef']:
     for k in ('Inputs','Mic','LineIn'): ref.pop(k, None)
 lay['LayoutID'] = 90; dump_frag(lay, 'layout90.xml')
 lay['LayoutID'] = 91; dump_frag(lay, 'layout91.xml')
+lay['LayoutID'] = 93; dump_frag(lay, 'layout93.xml')
 
 # Platforms 90: drop the ADC paths (nodes 7/8/9), keep the output path
 plat = load_frag('Platforms15.xml')
@@ -104,9 +120,28 @@ dump_frag(plat, 'Platforms92.xml')
 print('92 MinimumSampleRate nodes:', tagged92)
 assert tagged92 == OUT_PATH_NODES, tagged92
 
+# 93 and 94 SPLIT the input-strip, to find which half wakes the amp fault
+# that makes 90/91 hiss replug-proof at a verified 48 kHz:
+#   93 = layout XML keys dropped, Platforms ADC paths KEPT
+#   94 = layout XML keys kept,    Platforms ADC paths DROPPED
+# Both carry the rate fix. If either kills the ghost mics without the amp
+# fault, that is the ideal config: no ghost mics AND clean headphones.
+# Platforms93 == Platforms92 (stock paths + minrate); only its layout differs.
+dump_frag(plat, 'Platforms93.xml')
+
+plat = load_frag('Platforms15.xml')
+for pm in plat['PathMaps']:
+    pm['PathMap'] = [p for p in pm['PathMap'] if not any(n in (7,8,9) for n in nodes_in(p, []))]
+tagged94 = []
+for pm in plat['PathMaps']:
+    add_minrate(pm['PathMap'], tagged94)
+dump_frag(plat, 'Platforms94.xml')
+print('94 MinimumSampleRate nodes:', tagged94)
+assert tagged94 == OUT_PATH_NODES, tagged94
+
 info = plistlib.load(open('Info.plist','rb'))
 files = info['Files']
-for lid in (90, 91, 92):
+for lid in (90, 91, 92, 93, 94):
     if not any(e.get('Id')==lid for e in files['Layouts']):
         files['Layouts'].append({'Id':lid,'Path':f'layout{lid}.xml.zlib'})
         files['Platforms'].append({'Id':lid,'Path':f'Platforms{lid}.xml.zlib'})
@@ -119,7 +154,9 @@ src = [e for e in entries if e.get('CodecID')==283902518 and e.get('LayoutID')==
 assert len(src)==1
 changed = False
 for lid, tag in ((90,'output-only fork'), (91,'output-only + 48k-min fork'),
-                 (92,'stock-15 + 48k-min fork')):
+                 (92,'stock-15 + 48k-min fork'),
+                 (93,'48k-min, layout-keys dropped, ADC paths kept'),
+                 (94,'48k-min, layout-keys kept, ADC paths dropped')):
     if not any(e.get('CodecID')==283902518 and e.get('LayoutID')==lid for e in entries):
         dup = copy.deepcopy(src[0]); dup['LayoutID']=lid
         dup['Codec'] = str(src[0].get('Codec')) + f' (layout {lid}, {tag})'
@@ -144,12 +181,12 @@ def gate(n, c, d=""):
     global ok; print(("PASS " if c else "FAIL ")+n+("  "+d if d else "")); ok = ok and c
 d = plistlib.load(open(K+'/Contents/Info.plist','rb'))
 e = d['IOKitPersonalities']['as.vit9696.AppleALC']['HDAConfigDefault']
-gate("660 pinconfigs", len(e)==660, str(len(e)))
-for lid in (90, 91, 92):
+gate("662 pinconfigs", len(e)==662, str(len(e)))
+for lid in (90, 91, 92, 93, 94):
     hit = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==lid]
     gate(f"(ALC236,{lid}) present with ConfigData", len(hit)==1 and bool(hit[0].get('ConfigData')))
 blob = open(K+'/Contents/MacOS/AppleALC','rb').read()
-for lid in (90, 91, 92):
+for lid in (90, 91, 92, 93, 94):
     lz = open(W+f'/AppleALC/Resources/ALC236/layout{lid}.xml.zlib','rb').read()
     pz = open(W+f'/AppleALC/Resources/ALC236/Platforms{lid}.xml.zlib','rb').read()
     lr = open(W+f'/AppleALC/Resources/ALC236/layout{lid}.xml','rb').read()
@@ -168,12 +205,18 @@ gate("layout91 inputs stripped", b'<key>Inputs</key>' not in l91)
 gate("layout92 inputs intact",  b'<key>Inputs</key>' in l92)
 src = open(W+'/AppleALC/AppleALC/kern_resources.cpp').read()
 m = re.search(r'DEBUG_STRING\("ALC236"\),\s*0x236,\s*\w+,\s*\d+,\s*(\w+),\s*(\d+),\s*(\w+),\s*(\d+)', src)
-gate("20/20 tables", m and m.group(2)=='20' and m.group(4)=='20',
+gate("22/22 tables", m and m.group(2)=='22' and m.group(4)=='22',
      m and f"{m.group(2)}/{m.group(4)}" or "no match")
+gate("Platforms93 4x MinimumSampleRate", pinflate(93).count(b'MinimumSampleRate')==4)
+gate("Platforms94 4x MinimumSampleRate", pinflate(94).count(b'MinimumSampleRate')==4)
+l93 = zlib.decompress(open(W+'/AppleALC/Resources/ALC236/layout93.xml.zlib','rb').read())
+l94 = zlib.decompress(open(W+'/AppleALC/Resources/ALC236/layout94.xml.zlib','rb').read())
+gate("layout93 inputs stripped", b'<key>Inputs</key>' not in l93)
+gate("layout94 inputs intact",  b'<key>Inputs</key>' in l94)
 print("ALL GATES PASS" if ok else "GATE FAILURE")
 sys.exit(0 if ok else 1)
 PYEOF
 rm -rf "$OUT/AppleALC-multilayout.kext"
 cp -R "$W/AppleALC/build/Release/AppleALC.kext" "$OUT/AppleALC-multilayout.kext"
-echo "STAGED PERSISTENT: $OUT/AppleALC-multilayout.kext (alcid 90 / 91 / 92)"
+echo "STAGED PERSISTENT: $OUT/AppleALC-multilayout.kext (alcid 90 / 91 / 92 / 93 / 94)"
 md5 -q "$OUT/AppleALC-multilayout.kext/Contents/MacOS/AppleALC"
