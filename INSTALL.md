@@ -559,6 +559,14 @@ on the same machine were clean throughout.
 
 ### Enforcing 48 kHz automatically
 
+> **Stock-layout machines only.** If you built the minrate layout (`alcid=92`,
+> `MinimumSampleRate = 48000` — see the box at the top of §7), skip this whole
+> subsection. 44.1 kHz is unpublishable there, so the enforcer has nothing to
+> correct and the reference machine runs none. Installing it anyway adds a
+> resident audio-state writer for no benefit, which this project's history
+> argues against. This section is kept for machines on a stock layout, where
+> the problem it solves is real.
+
 Running the command by hand every time a call app pulls the rate down gets old.
 `--enforce` does it for you, and it is safe _because of how it is shaped_:
 
