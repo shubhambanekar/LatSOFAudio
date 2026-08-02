@@ -4,6 +4,21 @@ This document explains how LatSOFAudio captures from the DMIC array while
 AppleHDA keeps full ownership of playback on the **same PCI function**.
 It assumes familiarity with HDA controllers and basic IOKit.
 
+> **What ships today.** `LatSOFAudio.kext` v1.1.5, md5
+> `bf6945f4bf426d6ac9e9c97f1b911a58` ("patch-32"). Installed at
+> `/Library/Extensions` (auxiliary kernel collection), deliberately **not**
+> injected from the ESP — see "How the kext is loaded". Capture runs on
+> **SD6, stream tag 7**. The AFG keep-alive is **in-kernel** (patch-31); the
+> userland daemon is retired. The load path **has** the SD7 preflight
+> (patch-30). The reference machine boots `latsof_strictborrow=0`, which is
+> _not_ the compiled-in default (`gStrictBorrow = true`,
+> `LatSOFAudioDevice.cpp:339`) — that difference matters wherever the
+> borrowed-stream contract is discussed.
+>
+> Sections marked **SUPERSEDED BY: `<patch>`** describe paths this build no
+> longer takes. They are kept because the reasoning behind each one costs
+> about a day to rediscover.
+
 ## The hardware problem
 
 On Comet Lake, the HDA controller and the Smart Sound DSP (cAVS) are one
@@ -572,14 +587,29 @@ re-programs what it believes it still owns. The wake path already defers while
 the descriptor is busy — `jackPoll` checks `rd8(hdaBase, outSd) & SD_CTL_RUN` —
 but the `start()` path that calls `initDSP()` had no such check.
 
-**Patch 30 added it.** `outputSdBusyState()` is now called from both `start()`
-and `initDSP()`, classifying the output descriptor as free / RUNNING /
-programmed — RUN clear is not sufficient on its own, because CBL and BDL
-survive after AppleHDA stops a stream. A busy descriptor sets
-`gWakeReinitPending` and bails through `cleanup` *before* the snapshot is
-taken, so the bail writes nothing to a descriptor that is not ours. The old
-procedural rule here — do not hot-load while audio is playing — no longer
-applies, though rebooting remains the calmer path.
+**Patch 30 added it — with one qualification that matters on this machine.**
+`outputSdBusyState()` (`LatSOFAudioDevice.cpp:375-384`) is now called from
+both `start()` (`:700`) and `initDSP()` (`:1312`), classifying the output
+descriptor as free / RUNNING / programmed. RUN clear is not sufficient on its
+own, because CBL and BDL survive after AppleHDA stops a stream.
+
+The gate is `deferInit = (st == 1) || (st == 2 && gStrictBorrow)` (`:701`):
+
+- **RUNNING** (`st == 1`, audio actually streaming) — always defers, at both
+  check sites, publishing `Status = "deferred: AppleHDA output busy at load"`.
+- **Programmed** (`st == 2` — RUN clear but CBL/BDL live, which is SD7's state
+  for the rest of the session after AppleHDA's first playback) — defers only
+  under strict borrow. `gStrictBorrow` defaults true (`:339`), but the
+  reference machine boots `latsof_strictborrow=0`, which borrows a programmed
+  SD7 anyway and logs exactly that (`:714`).
+
+So on the default build the old prohibition is retired. **On this machine it
+is only half-retired:** hot-loading over live playback is safe, but
+hot-loading after anything has played since boot still borrows a programmed
+descriptor — the case recorded at `:2215-2224` as "persistent output static
+that even replugging the jack does not clear. Only a reboot did." The working
+rule here is therefore: quit audio, and if anything has played this session,
+reboot rather than hot-load.
 
 Given the loan is unavoidable, the contract is:
 

@@ -780,7 +780,11 @@ preflight on the load path, keeping the SD7 borrow.
 > `gWakeReinitPending` and bails through `cleanup` _before_ the snapshot is
 > taken, so a bail writes nothing to a descriptor that is not ours. The
 > procedural rule that stood here — "do not hot-load while audio is playing,
-> reboot" — is no longer required, though rebooting is still the calmer path.
+> reboot" — is retired **on the default build**. On the reference machine,
+> which boots `latsof_strictborrow=0`, only the RUNNING case defers: a
+> _programmed_ SD7 is borrowed anyway (`:701`, `:714`), so hot-loading after
+> anything has played this session can still produce the replug-proof static
+> recorded at `:2215-2224`. Quit audio, and reboot if the session has played.
 
 **Lessons:**
 

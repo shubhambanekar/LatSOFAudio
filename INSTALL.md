@@ -760,11 +760,17 @@ skip-approval bit. If you rebuild often and would rather never see the prompt,
 `0xA03` — `030a0000` in `config.plist` — adds that bit, at the cost of one more
 lowered SIP bit.
 
-**Don't do this while audio is playing.** The driver borrows AppleHDA's first
-output stream while it starts up; if AppleHDA is streaming at that moment the
-load hijacks the running stream and you get immediate loud static from the
-speakers, curable only by physically replugging the jack. Stop playback first —
-or skip the live load entirely and just reboot.
+**Don't do this while audio is playing — and prefer rebooting outright.** The
+driver borrows AppleHDA's first output stream while it starts up. Since
+patch-30 a _streaming_ descriptor is detected and the DSP init is deferred to
+the retry engine, publishing `Status = "deferred: AppleHDA output busy at
+load"` (see §5 — that is working-as-designed, not a failure). But a descriptor
+that is merely **programmed** — RUN clear, buffers still live, which is its
+state for the rest of the session once AppleHDA has played anything — is
+deferred only under the default `latsof_strictborrow=1`. The reference machine
+boots `latsof_strictborrow=0` and borrows it anyway, which can produce static
+that replugging does **not** clear. Stop playback first, and if this session
+has played audio at all, skip the live load and just reboot.
 
 **Then reboot.** `kmutil showloaded` reports the kext that is _running_, which
 is still the old one until you restart — a new hash on disk together with the

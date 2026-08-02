@@ -12,15 +12,38 @@ SOF firmware (Sound Open Firmware, Intel's open-source DSP firmware) on that
 DSP, builds a DMIC capture pipeline, and publishes the result to macOS as a
 normal CoreAudio input device.
 
-**Status: working.** 48 kHz / 2-channel stereo capture — QuickTime, system
-Dictation, FaceTime, browser conferencing, live input metering, and **Siri**,
-on the bare laptop with nothing plugged in. Survives sleep/wake, self-heals if
-the DSP wedges, and runs under stock AMFI with no security boot-args.
+**Status: working — v1.1.5 (patch-32), 2 Aug 2026.** 48 kHz / 2-channel stereo
+capture — QuickTime, system Dictation, FaceTime, browser conferencing, live
+input metering, and **Siri**, on the bare laptop with nothing plugged in.
+Survives sleep/wake, self-heals if the DSP wedges, and **needs no AMFI
+relaxation of its own** — no `amfi=0x80`, no library-validation override. (The
+reference machine runs AMFIPass for its OCLP-patched Wi-Fi, not for this
+driver.)
 
 To the author's knowledge this is the first working internal-DMIC capture path
 on macOS for this platform — and the first documentation anywhere of what
 macOS actually requires before it will let Siri use a microphone (see
 [Siri](#siri) below).
+
+## Reference configuration
+
+Everything below is written against this machine. **Anything not scoped to
+this configuration is scoped to a _stock_ AppleALC layout** — see
+[Headphone crackle](#headphone-crackle-not-a-microphone-problem).
+
+|                  |                                                                                                                                   |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Driver           | v1.1.5 (patch-32), `bf6945f4…` in `/Library/Extensions` — check with `kmutil showloaded \| grep -i latsof`                        |
+| AppleALC         | a **custom multilayout build**, booted `alcid=92` — stock 15 plus `MinimumSampleRate = 48000`, which makes 44.1 kHz unpublishable |
+| CodecCommander   | Sniki 2.7.3 fork, **debug variant**, with Perform Reset / on External Wake / on EAPD Fail forced true                             |
+| Boot-args        | `alcid=92 alcverbs=1 latsof_strictborrow=0 … -amfipassbeta`                                                                       |
+| SIP              | `csr-active-config = 0x803`                                                                                                       |
+| AMFI             | AMFIPass.kext on the ESP — **not** `amfi=0x80`                                                                                    |
+| Resident helpers | none running                                                                                                                      |
+
+The `alcid=92` layout is the single thing that makes headphones clean here. A
+stock-layout machine will meet faults this project already closed — they are
+documented, but as a field guide, not as the current path.
 
 ## Quick start
 
@@ -93,9 +116,11 @@ to the **bottom**, click **Allow**, then re-run the same `kmutil load -p`
 command — it should give `Code=28`. This recurs on every build whose binary
 differs; see [`INSTALL.md`](INSTALL.md) §4.
 
-Quit anything that's playing audio before you load. Loading the kext while
-AppleHDA is mid-stream can hijack that stream and produce loud static on the
-speakers, curable only by physically replugging the jack.
+Quit anything that's playing audio before you load — and if audio has played
+at all since boot, prefer rebooting to loading live. Loading while AppleHDA is
+mid-stream is caught and deferred since patch-30, but a descriptor that has
+merely been _used_ this session is still borrowed under
+`latsof_strictborrow=0`, which can produce static a replug will not clear.
 
 Then reboot — `kmutil showloaded` reports the kext that is _running_, which is
 the old one until you do; `kmutil inspect` is what shows you the bundle staged
@@ -359,20 +384,32 @@ than this driver.
 - **Voice Isolation / Wide Spectrum** mic modes are likewise Apple-internal.
 - **Apple Intelligence** is hardware-gated (T2 / Apple silicon) and no driver
   can change that. Siri itself works.
-- **You may see a second, dead "Internal Microphone"** in Sound settings —
-  that's AppleHDA's codec path, which records silence on this hardware because
-  no mic is wired to the codec. An output-only AppleALC layout removes it; see
-  the next section.
+- **You will see two dead inputs** in Sound settings — "Built-in Microphone"
+  and "Built-in Line Input" — both published by AppleHDA's codec path. The
+  first records silence, because no mic is wired to the codec; the second is
+  the combo jack's mic half, real hardware with nothing plugged into it.
+  **They cannot be removed, and trying is harmful:** every AppleALC layout
+  that removes them breaks the headphone amp (see Side results). The one real
+  problem they caused — selecting a ghost input wedged capture — was fixed in
+  the driver instead, by moving capture to SD6/tag 7 in patch-32. Note that
+  the `Input Source` field is not a way to tell them apart: **LatSOF DMIC
+  capture** also reports `Internal Microphone`, because that is this driver's
+  own data-source name.
 
 ## Side results that may be useful elsewhere
 
 - **An output-only codec layout works on Sequoia** — believed to be a first: an
   AppleALC layout for the ALC236 with **zero input paths** (id 90 in this
-  project's fork) boots and runs. The analog output engine publishes,
-  speakers/headphones and jack switching work, and the phantom input devices
-  are gone from every app's device picker. Sequoia's AppleHDA does not require
-  an ADC path in an analog PathMap. Useful for any dead-codec DMIC board
-  wanting an honest device list; a candidate for upstreaming to AppleALC.
+  project's fork) loads, the analog output engine publishes, and the phantom
+  input devices are gone from every picker. The genuinely novel finding is
+  narrow: Sequoia's AppleHDA does not require an ADC path in an analog
+  PathMap. **It is still unshippable.** With the ADC paths dropped, the
+  headphone amp emits replug-proof static — at verified 48 kHz and verified
+  D0, with the static and clean codec dumps byte-identical across nine
+  registers. Layout variants 90–97 walked every lever and none escaped it.
+  Recorded as a negative result, not a recipe: **do not
+  re-attempt this at the AppleALC layer.** See
+  [`DEBUGGING-LOG.md`](DEBUGGING-LOG.md), Phase 16.
 - **The full `'imic'` recipe for Siri acceptance** (see [Siri](#siri)) applies
   to any third-party macOS audio driver — kext, HAL plugin or DriverKit —
   wanting to be treated as a built-in microphone.
@@ -443,12 +480,15 @@ these before experimenting:
 - **Never start capture during boot.** A capture DMA started while AppleHDA is
   still initialising the same controller hangs the machine. The driver only
   starts DMA on demand.
-- **Don't hot-load the kext while audio is playing.** Every firmware load
-  borrows AppleHDA's first output stream descriptor. The wake path checks the
-  descriptor's RUN bit and defers while AppleHDA is streaming; the initial load
-  path does not yet, so loading over live playback hijacks the running stream
-  and produces immediate loud static, curable only by replugging the jack.
-  Install or update, then **reboot**.
+- **Prefer rebooting over hot-loading the kext.** Every firmware load borrows
+  AppleHDA's first output stream descriptor. Since patch-30 both the wake path
+  and the load path check that descriptor first, and a _streaming_ one always
+  defers (`Status = "deferred: AppleHDA output busy at load"`). A descriptor
+  that is merely _programmed_ — RUN clear, but buffers still live, which is
+  its state for the rest of the session after AppleHDA's first playback —
+  defers only under the default `latsof_strictborrow=1`. With
+  `latsof_strictborrow=0` it is borrowed anyway, which can produce static that
+  replugging does not clear. Install or update, then **reboot**.
 - Keep a recovery path for EFI edits (another OS that can mount the ESP, or a
   USB with a known-good EFI).
 - Don't run standalone capture test tools while the audio device is in use —
