@@ -1,35 +1,35 @@
 #!/bin/zsh
 #
-# Build a custom AppleALC for the Latitude 3410 (ALC236) carrying FIVE extra
+# Build a custom AppleALC for the Latitude 3410 (ALC236) carrying SIX extra
 # layouts, switchable by boot-arg alone — no kext swap needed to A/B.
 #
-# The input-strip has two independent halves, and 90/91 applied BOTH. Since
-# they hiss replug-proof at a verified 48 kHz while stock-based 92 does not,
-# one of the halves wakes an amp fault. 93 and 94 split them, so the 2x2 is:
+# THE 2x2 (tested on hardware 1 Aug, all four confirmed):
 #
-#            layout XML keys | Platforms ADC paths | ghost mics | amp fault
-#   alcid=91     dropped     |      dropped        |    none    |   YES
-#   alcid=92     kept        |      kept           |  present   |   no
-#   alcid=93     dropped     |      kept           |     ?      |    ?
-#   alcid=94     kept        |      dropped        |     ?      |    ?
+#   alcid | layout XML keys | Platforms ADC | ghost mics | headphones
+#   ------+-----------------+---------------+------------+---------------------
+#     92  | kept            | kept          | present    | clean   <- shipping
+#   90/91 | dropped         | dropped       | none       | STATIC
+#     93  | dropped         | kept          | -          | ZERO DEVICES, thrash
+#     94  | kept            | dropped       | none       | STATIC
 #
-# If 93 or 94 removes the ghost mics without the amp fault, that is the ideal
-# config. All five carry the 48 kHz rate fix except 90, kept byte-identical
-# as the historical reference.
+# Conclusions: the ghost mics come from the Platforms ADC PATHS (94 kept every
+# layout key and they still vanished), and deleting those paths is exactly what
+# breaks the headphone amp — at a verified 48 kHz and verified D0, so neither
+# the rate fault nor the D3 fault. Orphan paths without owning declarations (93)
+# make AppleHDA build nothing at all. So the ghost mics cannot be removed by
+# editing the path map: the one edit that removes them is the one that breaks
+# the amp.
 #
-#   alcid=90  output-only fork of layout 15 (ghost codec inputs stripped) —
-#             unchanged from alc236-layout90-rebuild.sh, kept as the rollback
-#   alcid=91  layout 90 PLUS MinimumSampleRate=48000 on every node of the
-#             surviving output path, so AppleHDA never advertises 44.1 kHz.
-#             44.1 is the static rate (INSTALL.md §7); making it unpublishable
-#             kills the cold-boot-stuck case and the FaceTime rate-drag case
-#             structurally, with no resident enforcer.
-#   alcid=92  stock layout 15 with ONLY MinimumSampleRate added (inputs and
-#             ghost mic devices left intact). The pre-agreed fallback: log
-#             archaeology (1 Aug) showed the static under layout 90 persisted
-#             at an enforced 48 kHz and a control experiment concluded the 90
-#             transform itself harms the headphone jack — so if 91 still
-#             hisses at 48 kHz, 92 isolates the rate fix from the input-strip.
+#     95  | kept            | kept          | ?          | ?   <- the new idea
+#
+# 95 attacks the other end: every path is left intact and the CODEC is told the
+# ghost pins are absent (ConfigData 0x411111f0 on 0x12 Mic-In and 0x19 Line-In,
+# leaving 0x14 Speaker and 0x21 HP-Out untouched). If AppleHDA declines to build
+# an input device for a pin with no physical connection, the ghost mics go away
+# with the output path never modified — no amp fault.
+#
+# 90 is kept byte-identical as the historical reference; all others carry the
+# 48 kHz rate fix.
 #
 # Precedent for the key: stock ALC256/Platforms99.xml (sibling codec) sets
 # MinimumSampleRate 48000 on its path nodes; ALC668, ALC260 and several
@@ -39,17 +39,45 @@
 # 44.1 disappears from the published formats — CoreAudio cannot select it.
 #
 set -e
-W="$1"                      # volatile workdir
+W="$1"                      # workdir — REUSED across runs, see below
 OUT="$HOME/Desktop/latsof-attempt2"
 mkdir -p "$W" && cd "$W"
-rm -rf AppleALC Lilu MacKernelSDK
-git clone -q --depth 30 https://github.com/acidanthera/AppleALC.git
-git clone -q --depth 30 https://github.com/acidanthera/Lilu.git
-git clone -q --depth 5  https://github.com/acidanthera/MacKernelSDK.git
-( cd AppleALC && git checkout -q "$(git describe --tags --abbrev=0)" )
-( cd Lilu     && git checkout -q "$(git describe --tags --abbrev=0)" )
-cp -R MacKernelSDK AppleALC/MacKernelSDK
-cp -R MacKernelSDK Lilu/MacKernelSDK
+
+# BE KIND TO THE MACHINE. Learned the hard way on 1 Aug: this build drove the
+# load average past 200 twice and forced a hard reboot, because
+# ResourceConverter/generate.sh reformats every plist of every codec in the
+# repo with `xargs -P $(getconf _NPROCESSORS_ONLN)` — 8-way parallel, thousands
+# of short-lived perl processes. That churn, not CPU or RAM, is what makes the
+# desktop unusable. Three mitigations, in order of how much they save:
+#
+#   1. REUSE the workdir. A fresh clone has no .md5 caches, so every one of
+#      ~2600 files is reprocessed (~60 min). Reusing skips all unchanged ones.
+#   2. Cap that parallelism to 2 so the machine stays responsive.
+#   3. nice the whole build.
+#
+# Pass a second argument "fresh" to force a clean re-clone.
+if [ "$2" = "fresh" ] || [ ! -d "$W/AppleALC/.git" ]; then
+    echo "=== fresh clone (slow: no resource caches) ==="
+    rm -rf AppleALC Lilu MacKernelSDK
+    git clone -q --depth 30 https://github.com/acidanthera/AppleALC.git
+    git clone -q --depth 30 https://github.com/acidanthera/Lilu.git
+    git clone -q --depth 5  https://github.com/acidanthera/MacKernelSDK.git
+    ( cd AppleALC && git checkout -q "$(git describe --tags --abbrev=0)" )
+    ( cd Lilu     && git checkout -q "$(git describe --tags --abbrev=0)" )
+    cp -R MacKernelSDK AppleALC/MacKernelSDK
+    cp -R MacKernelSDK Lilu/MacKernelSDK
+else
+    echo "=== reusing $W (resource caches intact) ==="
+    # Discard only OUR edits; keep every .md5 and .zlib so the slow reformat
+    # pass has nothing to redo. Untracked generated files are ours by
+    # definition — the transforms below regenerate them.
+    ( cd AppleALC && git checkout -q -- Resources 2>/dev/null || true )
+fi
+
+# Cap the reformat parallelism (mitigation 2). Idempotent.
+sed -i '' 's/xargs -P \$(getconf _NPROCESSORS_ONLN)/xargs -P 2/' \
+    "$W/AppleALC/ResourceConverter/generate.sh" 2>/dev/null || true
+
 echo "=== transforms ==="
 cd "$W/AppleALC/Resources/ALC236"
 python3 - <<'PYEOF'
@@ -139,9 +167,95 @@ dump_frag(plat, 'Platforms94.xml')
 print('94 MinimumSampleRate nodes:', tagged94)
 assert tagged94 == OUT_PATH_NODES, tagged94
 
+# layout 95 = layout 92 exactly (stock paths + minrate, inputs declared), but
+# the ghost mic PINS are disabled in the codec's own pin configuration rather
+# than by editing the path map. Decoded from the stock ConfigData:
+#   0x12 = 0x90a60100  fixed internal  Mic In   <- ghost "Built-in Microphone"
+#   0x14 = 0x90100110  fixed internal  Speaker      keep
+#   0x19 = 0x008b1020  jack            Line In  <- ghost "Built-in Line Input"
+#   0x21 = 0x002b1030  jack            HP Out       keep
+# The 2x2 proved the ghost mics come from the Platforms ADC paths, and that
+# deleting those paths is what breaks the headphone amp. This attacks the
+# other end: leave every path intact and have the CODEC report 0x12/0x19 as
+# absent (0x411111f0), so AppleHDA has no pin to build those inputs on. The
+# output pins are untouched, which is why the amp fault should not follow.
+#
+# layout 96 = the same idea as 95 but disabling ONLY pin 0x12.
+#
+# WHY 95 FAILED, and why this is not a repeat. Decoding the stock pin configs
+# shows 0x19 (Line In) and 0x21 (HP Out) both carry connection type 0xB =
+# COMBINATION: they are the two halves of ONE physical combo headset jack.
+# Telling AppleHDA that 0x19 does not exist therefore breaks the jack's
+# detect/switch logic, and the headphone half dies with it — which is exactly
+# what 91, 94 and 95 each did by a different route, and why all three hissed.
+#
+# The two "ghost" inputs are NOT equivalent:
+#   0x12  Fixed internal, Mic In, connection "Other Digital" = the internal
+#         DMIC. Genuinely phantom — that mic is wired to the SOF DSP, not the
+#         codec (the whole reason this project's kext exists). Nothing else
+#         depends on it, and it is not part of any jack.
+#   0x19  a REAL function of the combo jack (headset mic). Not a ghost, and
+#         load-bearing for the headphone output.
+#
+# So 96 disables 0x12 only. Expected: "Built-in Microphone" disappears,
+# "Built-in Line Input" remains (correctly — it is the headset mic), and the
+# headphone path is untouched in every respect.
+lay = load_frag('layout15.xml')
+lay['LayoutID'] = 96; dump_frag(lay, 'layout96.xml')
+plat96 = load_frag('Platforms15.xml')
+t96 = []
+for pm in plat96['PathMaps']:
+    for p_ in pm['PathMap']:
+        if not any(n in (7,8,9) for n in nodes_in(p_, [])):
+            add_minrate(p_, t96)
+dump_frag(plat96, 'Platforms96.xml')
+assert t96 == OUT_PATH_NODES, t96
+
+lay = load_frag('layout15.xml')
+lay['LayoutID'] = 95; dump_frag(lay, 'layout95.xml')
+# Platforms95 == Platforms92: stock paths, minrate on the output path only.
+plat = load_frag('Platforms15.xml')
+tagged95 = []
+for pm in plat['PathMaps']:
+    for p in pm['PathMap']:
+        if not any(n in (7,8,9) for n in nodes_in(p, [])):
+            add_minrate(p, tagged95)
+dump_frag(plat, 'Platforms95.xml')
+assert tagged95 == OUT_PATH_NODES, tagged95
+
+# layout 97 — THE DERIVED ANSWER (see header). Remove ONLY the internal
+# DMIC's input, consistently in both files, touching nothing of the combo
+# jack. Node map: ADC path [8,35,18] ends at pin 0x12 (phantom DMIC);
+# [9,34,25] ends at pin 0x19 (combo-jack mic — LOAD-BEARING, 4 proofs).
+#   layout: Inputs ['Mic','LineIn'] -> ['LineIn']; drop the 'Mic' dict only
+#   Platforms: drop only the path containing node 18; keep [9,34,25] + output
+#   ConfigData: stock (pin games proved useless in 95)
+lay = load_frag('layout15.xml')
+for ref in lay['PathMapRef']:
+    if 'Inputs' in ref:
+        ref['Inputs'] = [x for x in ref['Inputs'] if x != 'Mic']
+    ref.pop('Mic', None)
+lay['LayoutID'] = 97; dump_frag(lay, 'layout97.xml')
+plat97 = load_frag('Platforms15.xml')
+for pm in plat97['PathMaps']:
+    pm['PathMap'] = [p_ for p_ in pm['PathMap'] if 18 not in nodes_in(p_, [])]
+t97 = []
+for pm in plat97['PathMaps']:
+    for p_ in pm['PathMap']:
+        if not any(n in (7,8,9) for n in nodes_in(p_, [])):
+            add_minrate(p_, t97)
+dump_frag(plat97, 'Platforms97.xml')
+assert t97 == OUT_PATH_NODES, t97
+remaining = set()
+for pm in plat97['PathMaps']:
+    for p_ in pm['PathMap']: remaining.update(nodes_in(p_, []))
+assert 18 not in remaining and 8 not in remaining and 35 not in remaining, remaining
+assert {9, 34, 25} <= remaining, remaining
+print('97: Mic path removed; LineIn path preserved; nodes =', sorted(remaining))
+
 info = plistlib.load(open('Info.plist','rb'))
 files = info['Files']
-for lid in (90, 91, 92, 93, 94):
+for lid in (90, 91, 92, 93, 94, 95, 96, 97):
     if not any(e.get('Id')==lid for e in files['Layouts']):
         files['Layouts'].append({'Id':lid,'Path':f'layout{lid}.xml.zlib'})
         files['Platforms'].append({'Id':lid,'Path':f'Platforms{lid}.xml.zlib'})
@@ -156,20 +270,65 @@ changed = False
 for lid, tag in ((90,'output-only fork'), (91,'output-only + 48k-min fork'),
                  (92,'stock-15 + 48k-min fork'),
                  (93,'48k-min, layout-keys dropped, ADC paths kept'),
-                 (94,'48k-min, layout-keys kept, ADC paths dropped')):
+                 (94,'48k-min, layout-keys kept, ADC paths dropped'),
+                 (95,'48k-min, pins 0x12+0x19 disabled (FAILS: 0x19 is combo-jack)'),
+                 (96,'48k-min, ONLY pin 0x12 disabled (internal DMIC)'),
+                 (97,'48k-min, Mic input removed consistently; combo jack stock')):
     if not any(e.get('CodecID')==283902518 and e.get('LayoutID')==lid for e in entries):
         dup = copy.deepcopy(src[0]); dup['LayoutID']=lid
         dup['Codec'] = str(src[0].get('Codec')) + f' (layout {lid}, {tag})'
         entries.append(dup); changed = True
 if changed: plistlib.dump(pc, open(pc_path,'wb'))
+
+# layout 95 only: rewrite its ConfigData so the codec reports the ghost mic
+# pins as absent. Each pin default is four verbs (0x71C..0x71F) carrying one
+# byte each of a 32-bit config, little-end first; a verb word is
+# (nid << 20) | (verb << 8) | data. 0x411111f0 is the standard
+# "no physical connection" value.
+DISABLE = 0x411111f0
+GHOST_PINS = (0x12, 0x19)          # 0x12 Mic In (internal), 0x19 Line In (jack)
+e95 = [x for x in entries if x.get('CodecID')==283902518 and x.get('LayoutID')==95]
+assert len(e95) == 1
+cd = bytearray(e95[0]['ConfigData'])
+patched = 0
+for i in range(0, len(cd) - 3, 4):
+    w = int.from_bytes(cd[i:i+4], 'big')
+    nid, verb = (w >> 20) & 0xFF, (w >> 8) & 0xFFF
+    if nid in GHOST_PINS and 0x71C <= verb <= 0x71F:
+        byte = (DISABLE >> (8 * (verb - 0x71C))) & 0xFF
+        cd[i:i+4] = ((w & 0xFFFFFF00) | byte).to_bytes(4, 'big')
+        patched += 1
+assert patched == 8, f'expected 8 verb writes (2 pins x 4), patched {patched}'
+e95[0]['ConfigData'] = bytes(cd)
+print('layout 95 pin-disable: patched', patched, 'verbs on pins',
+      [hex(p) for p in GHOST_PINS])
+
+# layout 96: ONLY 0x12 (the internal DMIC). 0x19 is half of the combo jack
+# and must stay — see the block comment above layout 96.
+e96 = [x for x in entries if x.get('CodecID')==283902518 and x.get('LayoutID')==96]
+assert len(e96) == 1
+cd6 = bytearray(e96[0]['ConfigData'])
+p6 = 0
+for i in range(0, len(cd6) - 3, 4):
+    w = int.from_bytes(cd6[i:i+4], 'big')
+    nid, verb = (w >> 20) & 0xFF, (w >> 8) & 0xFFF
+    if nid == 0x12 and 0x71C <= verb <= 0x71F:
+        byte = (DISABLE >> (8 * (verb - 0x71C))) & 0xFF
+        cd6[i:i+4] = ((w & 0xFFFFFF00) | byte).to_bytes(4, 'big')
+        p6 += 1
+assert p6 == 4, f'expected 4 verb writes (1 pin x 4), patched {p6}'
+e96[0]['ConfigData'] = bytes(cd6)
+plistlib.dump(pc, open(pc_path,'wb'))
+print('layout 96 pin-disable: patched', p6, 'verbs on pin 0x12 only')
+
 print('transforms ok, pinconfigs:', len(entries))
 PYEOF
 echo "=== build Lilu ==="
-cd "$W/Lilu" && xcodebuild -configuration Debug -quiet 2>&1 | grep -E "error" || true
+cd "$W/Lilu" && nice -n 10 xcodebuild -configuration Debug -quiet 2>&1 | grep -E "error" || true
 [ -d build/Debug/Lilu.kext ] || { echo "LILU FAILED"; exit 1; }
 echo "=== build AppleALC ==="
 cd "$W/AppleALC" && cp -R ../Lilu/build/Debug/Lilu.kext .
-xcodebuild -configuration Release CODE_SIGNING_ALLOWED=NO 2>&1 | tail -2
+nice -n 10 xcodebuild -configuration Release CODE_SIGNING_ALLOWED=NO 2>&1 | tail -2
 [ -d build/Release/AppleALC.kext ] || { echo "APPLEALC FAILED"; exit 1; }
 echo "=== gates ==="
 python3 - "$W" <<'PYEOF'
@@ -181,12 +340,12 @@ def gate(n, c, d=""):
     global ok; print(("PASS " if c else "FAIL ")+n+("  "+d if d else "")); ok = ok and c
 d = plistlib.load(open(K+'/Contents/Info.plist','rb'))
 e = d['IOKitPersonalities']['as.vit9696.AppleALC']['HDAConfigDefault']
-gate("662 pinconfigs", len(e)==662, str(len(e)))
-for lid in (90, 91, 92, 93, 94):
+gate("665 pinconfigs", len(e)==665, str(len(e)))
+for lid in (90, 91, 92, 93, 94, 95, 96, 97):
     hit = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==lid]
     gate(f"(ALC236,{lid}) present with ConfigData", len(hit)==1 and bool(hit[0].get('ConfigData')))
 blob = open(K+'/Contents/MacOS/AppleALC','rb').read()
-for lid in (90, 91, 92, 93, 94):
+for lid in (90, 91, 92, 93, 94, 95, 96, 97):
     lz = open(W+f'/AppleALC/Resources/ALC236/layout{lid}.xml.zlib','rb').read()
     pz = open(W+f'/AppleALC/Resources/ALC236/Platforms{lid}.xml.zlib','rb').read()
     lr = open(W+f'/AppleALC/Resources/ALC236/layout{lid}.xml','rb').read()
@@ -205,7 +364,7 @@ gate("layout91 inputs stripped", b'<key>Inputs</key>' not in l91)
 gate("layout92 inputs intact",  b'<key>Inputs</key>' in l92)
 src = open(W+'/AppleALC/AppleALC/kern_resources.cpp').read()
 m = re.search(r'DEBUG_STRING\("ALC236"\),\s*0x236,\s*\w+,\s*\d+,\s*(\w+),\s*(\d+),\s*(\w+),\s*(\d+)', src)
-gate("22/22 tables", m and m.group(2)=='22' and m.group(4)=='22',
+gate("25/25 tables", m and m.group(2)=='25' and m.group(4)=='25',
      m and f"{m.group(2)}/{m.group(4)}" or "no match")
 gate("Platforms93 4x MinimumSampleRate", pinflate(93).count(b'MinimumSampleRate')==4)
 gate("Platforms94 4x MinimumSampleRate", pinflate(94).count(b'MinimumSampleRate')==4)
@@ -213,10 +372,52 @@ l93 = zlib.decompress(open(W+'/AppleALC/Resources/ALC236/layout93.xml.zlib','rb'
 l94 = zlib.decompress(open(W+'/AppleALC/Resources/ALC236/layout94.xml.zlib','rb').read())
 gate("layout93 inputs stripped", b'<key>Inputs</key>' not in l93)
 gate("layout94 inputs intact",  b'<key>Inputs</key>' in l94)
+cd95 = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==95][0]['ConfigData']
+cd92 = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==92][0]['ConfigData']
+def decode(cd):
+    pins={}
+    for i in range(0, len(cd)-3, 4):
+        w=int.from_bytes(cd[i:i+4],'big'); nid=(w>>20)&0xFF; vb=(w>>8)&0xFFF; da=w&0xFF
+        if 0x71C<=vb<=0x71F: pins.setdefault(nid,[0,0,0,0])[vb-0x71C]=da
+    return {n:(b[3]<<24|b[2]<<16|b[1]<<8|b[0]) for n,b in pins.items()}
+p95, p92 = decode(cd95), decode(cd92)
+gate("95: pin 0x12 disabled", p95.get(0x12)==0x411111f0, hex(p95.get(0x12,0)))
+gate("95: pin 0x19 disabled", p95.get(0x19)==0x411111f0, hex(p95.get(0x19,0)))
+gate("95: speaker 0x14 untouched", p95.get(0x14)==p92.get(0x14), hex(p95.get(0x14,0)))
+gate("95: headphone 0x21 untouched", p95.get(0x21)==p92.get(0x21), hex(p95.get(0x21,0)))
+gate("92 pins unchanged by the patch", p92.get(0x12)==0x90a60100 and p92.get(0x19)==0x008b1020)
+cd96 = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==96][0]['ConfigData']
+p96 = decode(cd96)
+gate("96: pin 0x12 disabled (internal DMIC)", p96.get(0x12)==0x411111f0, hex(p96.get(0x12,0)))
+gate("96: pin 0x19 KEPT (combo jack half)", p96.get(0x19)==p92.get(0x19), hex(p96.get(0x19,0)))
+gate("96: speaker 0x14 untouched", p96.get(0x14)==p92.get(0x14), hex(p96.get(0x14,0)))
+gate("96: headphone 0x21 untouched", p96.get(0x21)==p92.get(0x21), hex(p96.get(0x21,0)))
+WRAP_A = b'<?xml version="1.0"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "d.dtd"><plist version="1.0">'
+WRAP_B = b'</plist>'
+l97 = plistlib.loads(WRAP_A + zlib.decompress(open(W+'/AppleALC/Resources/ALC236/layout97.xml.zlib','rb').read()) + WRAP_B)
+ref97 = l97['PathMapRef'][0]
+gate("97: Inputs == [LineIn]", ref97.get('Inputs')==['LineIn'], str(ref97.get('Inputs')))
+gate("97: Mic dict removed",   'Mic' not in ref97)
+gate("97: LineIn dict kept",   'LineIn' in ref97)
+p97pl = plistlib.loads(WRAP_A + zlib.decompress(open(W+'/AppleALC/Resources/ALC236/Platforms97.xml.zlib','rb').read()) + WRAP_B)
+def walk(x, acc):
+    if isinstance(x, dict):
+        if 'NodeID' in x: acc.add(x['NodeID'])
+        for v in x.values(): walk(v, acc)
+    elif isinstance(x, list):
+        for v in x: walk(v, acc)
+    return acc
+n97 = set()
+for pm in p97pl['PathMaps']: walk(pm['PathMap'], n97)
+gate("97: DMIC path gone (no 8/35/18)", not ({8,35,18} & n97), str(sorted(n97)))
+gate("97: LineIn path kept (9,34,25)", {9,34,25} <= n97)
+gate("97: output path kept (20,2,33,3)", {20,2,33,3} <= n97)
+cd97 = [x for x in e if x.get('CodecID')==283902518 and x.get('LayoutID')==97][0]['ConfigData']
+gate("97: ConfigData stock (== 92)", cd97 == cd92)
 print("ALL GATES PASS" if ok else "GATE FAILURE")
 sys.exit(0 if ok else 1)
 PYEOF
 rm -rf "$OUT/AppleALC-multilayout.kext"
 cp -R "$W/AppleALC/build/Release/AppleALC.kext" "$OUT/AppleALC-multilayout.kext"
-echo "STAGED PERSISTENT: $OUT/AppleALC-multilayout.kext (alcid 90 / 91 / 92 / 93 / 94)"
+echo "STAGED PERSISTENT: $OUT/AppleALC-multilayout.kext (alcid 90-97)"
 md5 -q "$OUT/AppleALC-multilayout.kext/Contents/MacOS/AppleALC"
