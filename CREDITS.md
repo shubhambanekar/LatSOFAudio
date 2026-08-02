@@ -75,7 +75,7 @@ For honesty's sake, the contributions specific to this project are:
 - The borrowed-stream contract: the finding that the firmware code loader
   necessarily runs over AppleHDA's first output engine, and the
   snapshot-once / restore-once / never-write-again invariant — verified by
-  re-reading the descriptor after the driver's *last* write to it — that
+  re-reading the descriptor after the driver's _last_ write to it — that
   makes the borrow survivable across sleep/wake. Documented in
   `ARCHITECTURE.md`; the week it ended is Phase 13 of `DEBUGGING-LOG.md`.
 - Board-specific configuration for the Dell Latitude 3410 derived from its own

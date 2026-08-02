@@ -3,6 +3,7 @@
 Goal of this stage: **boot the DSP firmware and reach FW_READY.** Nothing else.
 
 ## Applied automatically
+
 - matching changed to `IOResources` + registry walk (coexists with AppleHDA)
 - `pciDevice->open()` removed
 - D3→D0 power cycle removed
@@ -26,6 +27,7 @@ Goal of this stage: **boot the DSP firmware and reach FW_READY.** Nothing else.
 4. **Capture channels** — `kCmlSOF_CapChannels` 4 → 2 (your DMIC is stereo).
 
 ## Build & test
+
 ```sh
 make
 sudo diskutil mount disk0s1
