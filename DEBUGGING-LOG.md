@@ -754,7 +754,8 @@ descriptor index and stream tag were still not varied independently. Anyone
 revisiting this should vary the tag first, and should budget for the same
 microphone outage.
 
-**The bug that motivated the patch is still open.** It was never *which*
+**The bug that motivated the patch was still open at the end of this phase —
+patch 30 closed it.** (See the note at the end of this section.) It was never *which*
 descriptor gets borrowed — it is *when*. A `kmutil load -p` that takes effect on
 the running system, rather than staging for the next reboot, runs `start()` at
 whatever moment you typed the command, and `initDSP()` takes SD7 regardless of
@@ -767,11 +768,19 @@ SD-Borrow: ctl=0x14001e     (RUN | IOCE | FEIE | DEIE — AppleHDA streaming)
 followed by immediate loud static on the speakers, curable only by replugging
 the jack. The wake path already handles this case: `jackPoll`'s retry engine
 tests `rd8(hdaBase, outSd) & SD_CTL_RUN` and defers the rebuild while the
-descriptor is busy. The load path — `start()`'s call to `initDSP()`, line 471 of
-`LatSOFAudioDevice.cpp` in the committed build — has no such check. The correct
-fix is that same defer-and-retry preflight on the load path, keeping the SD7
-borrow. Until someone writes it, the rule is procedural: do not hot-load the
-kext while audio is playing. Reboot.
+descriptor is busy. The load path — `start()`'s call to `initDSP()` — had no
+such check at the time of writing. The correct fix is that same defer-and-retry
+preflight on the load path, keeping the SD7 borrow.
+
+> **Closed by patch 30.** That preflight now exists on the load path:
+> `outputSdBusyState()` is called from both `start()` and `initDSP()`, and
+> classifies the descriptor as free / RUNNING / programmed — RUN clear is not
+> enough, because CBL and BDL live on after AppleHDA stops a stream and the
+> FIFO position is not register state. A busy descriptor defers via
+> `gWakeReinitPending` and bails through `cleanup` *before* the snapshot is
+> taken, so a bail writes nothing to a descriptor that is not ours. The
+> procedural rule that stood here — "do not hot-load while audio is playing,
+> reboot" — is no longer required, though rebooting is still the calmer path.
 
 **Lessons:**
 
