@@ -247,9 +247,12 @@ automation caused a worse fault than the one it fixed, and was retracted.
 and the rate is corrected solely after it has been wrong *continuously* for
 eight seconds. A jack plug settles long before that and never triggers it; a
 call app holding the output at 44.1 does, and gets corrected once. Both
-behaviours were verified before it shipped. Run it from a LaunchAgent if you
-want it permanent — the recipe is in [`INSTALL.md`](INSTALL.md) §7 — or keep
-using the one-shot `latsof-setrate 48000` followed by a replug or sleep/wake.
+behaviours were verified before it shipped. On a machine running the minrate
+layout (see the note at the top of this section) there is nothing for it to
+do and it should not be run resident at all; on a stock layout, prefer the
+one-shot `latsof-setrate 48000` followed by a replug or sleep/wake, and treat
+the LaunchAgent recipe in [`INSTALL.md`](INSTALL.md) §7 as the last resort it
+was written to be.
 Remember that pinning the rate alone never reprograms the codec path; only an
 engine rebuild does.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
