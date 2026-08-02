@@ -231,7 +231,9 @@ argument with AMFIPass (plus `-amfipassbeta`, since that build predates
 Sequoia) satisfied the WiFi stack without breaking permissions.
 
 QuickTime then recorded. Both security relaxations were subsequently removed
-and verified unnecessary — the machine runs stock AMFI enforcement.
+and verified unnecessary for this driver. (The machine itself does run
+AMFIPass with `-amfipassbeta`, for its OCLP-patched Wi-Fi — but nothing in
+the audio path needs it.)
 
 **Lesson:** an unexplained boot hang after removing a boot argument means
 something else in your EFI depended on it. Find out what before restoring it
@@ -780,7 +782,11 @@ preflight on the load path, keeping the SD7 borrow.
 > `gWakeReinitPending` and bails through `cleanup` _before_ the snapshot is
 > taken, so a bail writes nothing to a descriptor that is not ours. The
 > procedural rule that stood here — "do not hot-load while audio is playing,
-> reboot" — is no longer required, though rebooting is still the calmer path.
+> reboot" — is retired **on the default build**. On the reference machine,
+> which boots `latsof_strictborrow=0`, only the RUNNING case defers: a
+> _programmed_ SD7 is borrowed anyway (`:701`, `:714`), so hot-loading after
+> anything has played this session can still produce the replug-proof static
+> recorded at `:2215-2224`. Quit audio, and reboot if the session has played.
 
 **Lessons:**
 
@@ -834,7 +840,7 @@ keep-alive"). Every previous attempt had failed because every previous
 attempt targeted the headphone pin — the child, not the parent.
 
 **The ghost mics — a closed negative.** The dead "Built-in Microphone" and
-"Built-in Line Input" devices could not be removed. Six layout variants
+"Built-in Line Input" devices could not be removed. Layout variants
 (90–97) walked every lever on hardware: strip the layout's input keys, strip
 the Platforms ADC paths, disable the pins in ConfigData, and the surgical
 combination of them. Result: inconsistent edits make AppleHDA publish
