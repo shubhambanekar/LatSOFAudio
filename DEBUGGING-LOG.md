@@ -41,7 +41,7 @@ for a problem that had nothing to do with the microphone. Take them.
 
 **Also learned here:** the ALC236's analog microphone pins (nodes `0x19` and
 `0x1a`) both read `Pin Default 0x411111f0` — not connected. The codec has mic
-pin *widgets* but they are unwired on this board, so the headset jack cannot
+pin _widgets_ but they are unwired on this board, so the headset jack cannot
 carry a microphone either. The DSP genuinely was the only route. This is worth
 checking before committing to a project like this, because it determines
 whether a $15 USB microphone would have solved the problem instead.
@@ -128,7 +128,7 @@ at zero for the entire run. Twice.
 
 The cause was found by reading the source rather than adding logging:
 `initDSP`'s `PPCTL` decouple write uses the member `capIdx` about 270 lines
-*before* it is assigned. It therefore ran with the constructor's zero — so
+_before_ it is assigned. It therefore ran with the constructor's zero — so
 **SD1 was never decoupled, and AppleHDA's SD0 was decoupled instead, on every
 single boot.** That had been happening silently and harmlessly for days, which
 is why nothing audible ever broke and why nobody noticed.
@@ -140,7 +140,7 @@ send. `RUN=1`, IPCs acknowledged, position pinned at zero forever.
 Fixed in patch 10: decouple the correct descriptor at capture start, re-couple
 at stop, and set `no_stream_position=1` as a poll-only driver requires.
 
-**Lesson:** when a hardware register write does nothing, check *when* the value
+**Lesson:** when a hardware register write does nothing, check _when_ the value
 it depends on was assigned. And a bug that silently misconfigures someone
 else's stream can hide indefinitely.
 
@@ -154,7 +154,7 @@ Mechanism: initialisation unmasked the DSP IPC interrupt (`HIPCCTL=0x03`,
 acknowledged during init. The failed `TRIG_START` left the firmware posting
 notifications nobody acked, holding the shared `00:1f.3` interrupt line
 asserted until macOS throttled it — and that line is how AppleHDA receives
-*its* interrupts.
+_its_ interrupts.
 
 Fixed in patch 11: keep `ADSPIC` bit 0 masked in steady state, and drain and
 acknowledge `TDR` at capture start, after trigger, at stop entry, and after
@@ -164,7 +164,7 @@ again on every exit path — a post-fix audit found the failure paths didn't,
 and closed them; see patches 25–26 in `history/README.md`.)
 
 **Lesson (first time):** on a shared PCI function, an interrupt you enable and
-don't service breaks the *other* driver. Note that this lesson had to be
+don't service breaks the _other_ driver. Note that this lesson had to be
 learned twice — see Phase 11.
 
 ## Phase 7 — Real audio
@@ -206,7 +206,7 @@ while root could, so every signing operation "succeeded" and every
 verification failed. macOS reports an unreadable `Info.plist` as an invalid
 signature.
 
-The fix is `chmod`, a clean `ditto`, signing the *installed* copy last, and a
+The fix is `chmod`, a clean `ditto`, signing the _installed_ copy last, and a
 `codesign --verify` gate before restarting `coreaudiod`. All four steps are now
 encoded in the plugin's Makefile with a comment explaining why, so the failure
 cannot recur.
@@ -226,7 +226,7 @@ never solved. It breaks TCC permission prompts system-wide.
 
 Removing it hung the machine at the Apple logo. Recovery from Windows again.
 The reason turned out to be unrelated to audio: this EFI runs the OCLP
-modern-WiFi stack, and *that* is what needs AMFI relaxed. Replacing the boot
+modern-WiFi stack, and _that_ is what needs AMFI relaxed. Replacing the boot
 argument with AMFIPass (plus `-amfipassbeta`, since that build predates
 Sequoia) satisfied the WiFi stack without breaking permissions.
 
@@ -254,7 +254,7 @@ about one second.
 
 The theory was clock drift. The plugin's `GetZeroTimeStamp` was inherited from
 Apple's NullAudio sample, which manufactures a timeline from
-`mach_absolute_time()` at a *nominal* 48 kHz with nothing tying it to the DSP's
+`mach_absolute_time()` at a _nominal_ 48 kHz with nothing tying it to the DSP's
 independent DMA clock. `coreaudiod` was logging
 `HALS_IOA1Engine::EndWriting` failing with `0xE00002EE` — `kIOReturnIsoTooOld`,
 "timestamp for the distant past" — and burning 25% CPU. It fit.
@@ -271,7 +271,7 @@ So: profile instead of theorise. `sudo sample coreaudiod 10` — and this
 driver's symbols appeared **zero times**. The 25% CPU was `coreaudiod`
 formatting its own overload reports: `SendAnyPendingOverloadReports` →
 `AudioAnalyticsSendMessage` → Swift dictionary description → `NSNumber` →
-CFString formatting. It was burning CPU *describing* the problem, not causing
+CFString formatting. It was burning CPU _describing_ the problem, not causing
 it.
 
 That reframing found the real cause in the kext, one register decode away.
@@ -300,7 +300,7 @@ never a separate bug.
 
 - Profile before theorising about a CPU symptom. One command disproved an hour
   of reasoning.
-- High CPU in a process does not mean high CPU in *your* code. It may be that
+- High CPU in a process does not mean high CPU in _your_ code. It may be that
   process working hard to report your fault.
 - This is the same lesson as Phase 6. It was missed the second time because the
   first fix addressed the DSP mailbox interrupt specifically, and the stream
@@ -343,7 +343,7 @@ that returns an impossible result is telling you about itself.
 
 The driver was declared finished at the end of Phase 12. Then it went to sleep.
 
-After any sleep, audio broke. *Which* audio varied between wakes — sometimes
+After any sleep, audio broke. _Which_ audio varied between wakes — sometimes
 the mic, sometimes the speakers, sometimes both. A reboot always restored
 everything. Worth separating two bugs here: the original failure was mic-only
 and speakers survived; speaker failure appeared **later**, introduced by
@@ -387,7 +387,7 @@ The same block also ran on the two IPC-timeout paths, which `goto cleanup` and
 so jump clean over the hand-back entirely.
 
 And the reason a week of measurement pointed nowhere: `SD-Return`, the property
-reporting the restore, is written *immediately after* the restore — before all
+reporting the restore, is written _immediately after_ the restore — before all
 three of those. It reported a perfect hand-back, accurately, every time. The
 damage happened afterwards.
 
@@ -407,7 +407,7 @@ input session down across sleep, so the re-arm written to fix it never fires.
 
 **Lesson:** telemetry that reports success proves only that the reporting line
 ran. If a function keeps working after it publishes a result, the result
-describes an intermediate state, not the outcome. Read the register *after* the
+describes an intermediate state, not the outcome. Read the register _after_ the
 last write, and when you borrow another driver's hardware, make the give-back
 idempotent and call it from every exit path — including the ones that fail.
 
@@ -416,9 +416,9 @@ idempotent and call it from every exit path — including the ones that fail.
 ## Phase 14 — Siri hears the laptop
 
 This phase starts from a conclusion this project had already written down, in
-the README, in confident language: *Siri's device selector admits only
+the README, in confident language: _Siri's device selector admits only
 kernel-published `IOAudioFamily` devices and excludes userspace
-`AudioServerPlugIn` devices by class.* It came out of an experiment that looked
+`AudioServerPlugIn` devices by class._ It came out of an experiment that looked
 decisive. With a custom output-only AppleALC layout (id 90) making the HAL
 plugin's microphone the **only** input device in the entire system, Siri still
 said "Siri Not Available — Connect a microphone" and `corespeechd` logged
@@ -439,12 +439,12 @@ then one, then none. Four of them are worth naming because they were real, and
 because of what they have in common.
 
 - The `Info.plist` declared an `IOAudioFamily` dependency floor of **`1.0.0b1`**.
-  The family's compatible version is `1.0`, and `1.0.0b1` sorts *below* `1.0`.
+  The family's compatible version is `1.0`, and `1.0.0b1` sorts _below_ `1.0`.
   The kext could not have linked. It would simply never have loaded, and the
   first hardware session would have been spent hunting a phantom.
 - The wrap detector's timestamps were not back-dated, injecting 0–100 ms of
   clock jitter into a driver whose whole timing story is counted DMA wraps.
-- Clearing the demand latch after a *failed* engine start used a second,
+- Clearing the demand latch after a _failed_ engine start used a second,
   separate command-gate `runAction`. The 500 ms `jackPoll` tick could interleave
   between the refusal and the clear, start headless DMA, and leave nothing in
   the system able to stop it.
@@ -474,7 +474,7 @@ fine, the fault "must" be in the thing deployed. It was not.
 
 `kmutil inspect`, piped through `awk` to attribute every loaded kext to the
 collection it lives in, showed **`IOAudioFamily` is in the System kernel
-collection**. OpenCore injects into the *Boot* kernel collection and can only
+collection**. OpenCore injects into the _Boot_ kernel collection and can only
 link injected kexts against that collection. It hit a dependency it could not
 resolve, dropped the bundle, and said nothing at all about it.
 
@@ -500,7 +500,7 @@ prepared. Everything was ready to install.
 Research killed it, with about ten minutes to spare. Two findings:
 
 - On Sequoia the kexts in `/S/L/E` are binary-less stubs. The KDK is not a
-  convenience here, it is the *only* source of the binary at all — which should
+  convenience here, it is the _only_ source of the binary at all — which should
   itself have been a signal about how far off the beaten path this was.
 - Nobody in the kernel-collection era has demonstrated an injected
   `IOAudioFamily` coexisting with a **live** AppleHDA. The injected copy would
@@ -511,7 +511,7 @@ Research killed it, with about ten minutes to spare. Two findings:
 The Wi-Fi precedent does not transfer, and the reason is precise: there,
 OpenCore can `Block`/`Exclude` the original, so exactly one copy exists. You
 cannot block a kext in the System collection. The precedent only proves that
-injection works *when you can remove the duplicate*.
+injection works _when you can remove the duplicate_.
 
 And the answer already existed. acidanthera/bugtracker **#1658** is a kX/
 VoodooHDA user hitting this identical wall on 11.3, and the upstream
@@ -655,7 +655,7 @@ And was silent. Two things then looked broken and were not:
 - **The listening tone no longer plays.** This is deliberate macOS behaviour:
   the beep is suppressed when `supportsEchoCancellation` is 0 on a built-in
   microphone, because the microphone would otherwise hear it. The tone this
-  project remembered was the *external*-mic code path, from all those months of
+  project remembered was the _external_-mic code path, from all those months of
   testing with a dongle attached.
 - **Ducking looked suspicious** and was verified healthy — clean mute/restore
   pairs throughout the log.
@@ -738,7 +738,7 @@ And the DSP did not boot:
 ```
 
 Microphone dead. Treat the free-stream approach as a dead end: on this hardware
-the ROM code loader wants `SD(numISS)` — the first *output* descriptor — and the
+the ROM code loader wants `SD(numISS)` — the first _output_ descriptor — and the
 freedom of the descriptor bought nothing. Reverted to the committed build (md5
 `90563e1c`, UUID `24E00A16`); the failed source is kept **outside** the repo at
 `~/Desktop/LatSOF/latsof-attempt2/patch28-failed-attempt.cpp.bak` so the next person
@@ -755,8 +755,8 @@ revisiting this should vary the tag first, and should budget for the same
 microphone outage.
 
 **The bug that motivated the patch was still open at the end of this phase —
-patch 30 closed it.** (See the note at the end of this section.) It was never *which*
-descriptor gets borrowed — it is *when*. A `kmutil load -p` that takes effect on
+patch 30 closed it.** (See the note at the end of this section.) It was never _which_
+descriptor gets borrowed — it is _when_. A `kmutil load -p` that takes effect on
 the running system, rather than staging for the next reboot, runs `start()` at
 whatever moment you typed the command, and `initDSP()` takes SD7 regardless of
 what is on it. Measured, with audio playing:
@@ -777,7 +777,7 @@ preflight on the load path, keeping the SD7 borrow.
 > classifies the descriptor as free / RUNNING / programmed — RUN clear is not
 > enough, because CBL and BDL live on after AppleHDA stops a stream and the
 > FIFO position is not register state. A busy descriptor defers via
-> `gWakeReinitPending` and bails through `cleanup` *before* the snapshot is
+> `gWakeReinitPending` and bails through `cleanup` _before_ the snapshot is
 > taken, so a bail writes nothing to a descriptor that is not ours. The
 > procedural rule that stood here — "do not hot-load while audio is playing,
 > reboot" — is no longer required, though rebooting is still the calmer path.
@@ -799,9 +799,9 @@ preflight on the load path, keeping the SD7 borrow.
 
 ## Phase 16 — Three faults wearing one costume
 
-*(1–2 Aug 2026. The "headphone static" that had been chased for a week
+_(1–2 Aug 2026. The "headphone static" that had been chased for a week
 turned out to be three unrelated faults, each hiding the others' evidence.
-Patches 29–32; commits `c9daea1` through `1c94960`.)*
+Patches 29–32; commits `c9daea1` through `1c94960`.)_
 
 The presenting symptom was singular — static from the 3.5 mm jack — and
 every earlier theory treated it as one bug. Separating it took two things
@@ -819,7 +819,7 @@ it" was just re-rolling that dice. The structural fix came from reading
 stock AppleALC resources: sibling codecs ship `MinimumSampleRate = 48000`
 on their path nodes. Disassembling the running kernel collection confirmed
 `AppleHDAPath::isAudioStreamSupported` treats it as a hard gate, so a
-custom layout carrying the key makes 44.1 kHz *unpublishable* — no
+custom layout carrying the key makes 44.1 kHz _unpublishable_ — no
 enforcer, no daemon, nothing to keep running. `alcid=92` ships.
 
 **Fault B — the idle-plug static.** Plug headphones while the engine is
@@ -838,8 +838,8 @@ attempt targeted the headphone pin — the child, not the parent.
 (90–97) walked every lever on hardware: strip the layout's input keys, strip
 the Platforms ADC paths, disable the pins in ConfigData, and the surgical
 combination of them. Result: inconsistent edits make AppleHDA publish
-*nothing* (93: zero devices, load average 156); consistent removal works but
-brings replug-proof static — at verified 48 kHz *and* verified D0, with the
+_nothing_ (93: zero devices, load average 156); consistent removal works but
+brings replug-proof static — at verified 48 kHz _and_ verified D0, with the
 static and clean codec dumps **byte-identical across nine registers**. The
 amp fault lives below the codec's programmable state, and the one edit that
 removes the ghosts is the one edit that triggers it. Layouts also taught:
@@ -863,11 +863,11 @@ is the documented signature of borrowing a hot descriptor. The evidence for
 the split arrived unprompted: the rebuild that failed twelve times under
 churn succeeded first-try at the next wake, same code, same firmware.
 
-Three lessons for the pile. A property that is *absent* must be
+Three lessons for the pile. A property that is _absent_ must be
 distinguishable from a mechanism that ran and found nothing — the AFG fix
 shipped once with a verb addressing the wrong node, and the silence looked
 exactly like health (`AFG-Probe` now exists so it never can again). Second:
-disabled pins strip engine *names*, not engines — count
+disabled pins strip engine _names_, not engines — count
 `AppleHDAEngineInput` instances, never grep `IOAudioEngineDescription`, or
 layout 95's false "success" will repeat. Third: every "impossible" fault
 this phase yielded to the same two-dump diff; the one that produced an
@@ -883,7 +883,7 @@ to cost you a day:
 1. Verify under Linux first. Do not write kernel code to answer a hardware
    question.
 2. Enable no interrupts, at any level, and clear `SDSTS` at both ends. The
-   symptom of getting this wrong is *playback* breaking.
+   symptom of getting this wrong is _playback_ breaking.
 3. Never start DMA at boot.
 4. Profile before theorising, and check whether the CPU you are looking at is
    actually yours.

@@ -39,12 +39,12 @@ from it.
   and `PPCTL` — reachable from any `StartPlayback` call, which on this board
   is guaranteed to fail (no I2S codec, so it selects a pipeline this fork
   deletes from the topology). Removed, and playback selectors now refuse.
-  If you derive from the same reference, grep for *every* `GCTL` write, not
+  If you derive from the same reference, grep for _every_ `GCTL` write, not
   just the one in the init path.
 - **Stream-descriptor partitioning.** GCAP `0x9701` advertises 7 input and 9
   output DMA engines, so SD0–SD6 are input descriptors and SD7–SD15 output.
   This driver captures on input descriptor **SD6 with stream tag 7** — the
-  *last* input descriptor, deliberately. It originally sat on SD1 ("SD0 is
+  _last_ input descriptor, deliberately. It originally sat on SD1 ("SD0 is
   AppleHDA's"), which was safe while AppleHDA published a single input
   engine. The moment the layout publishes more — the reference machine's
   layout 92 publishes two — selecting the second one runs a **real DMA
@@ -72,7 +72,7 @@ from it.
   owned its device and could handle interrupts; this one cannot. Concretely:
   never set `IOCE`, `FEIE` or `DEIE` in the capture stream's `SDCTL`, never set
   the stream's `SIE` bit in the controller's `INTCTL`, and clear `SDSTS`
-  (write-1-to-clear) at both start *and* stop. See "The interrupt-starvation
+  (write-1-to-clear) at both start _and_ stop. See "The interrupt-starvation
   bug" below for what happens otherwise.
 - **Poll-only IPC; the DSP interrupt stays masked.** `00:1f.3` has one
   interrupt line shared with AppleHDA. If firmware→host notifications
@@ -145,7 +145,7 @@ ring. `LatSOFAudioDevice::start()` creates, attaches and starts the device after
 outlives both by construction, which is what makes not retaining safe. Publication
 failure is deliberately non-fatal — capture still works through the UserClient —
 but it logs loudly, because being visible to the system's voice stack is the
-entire reason the class exists. Teardown runs *first* in the owner's `stop()`,
+entire reason the class exists. Teardown runs _first_ in the owner's `stop()`,
 while the workloop and gated capture paths are still alive, because terminating
 the engine can call back into `engineStopCapture()` and that must find working
 machinery.
@@ -155,7 +155,7 @@ below for what survived the move and what did not.
 
 **Zero copy.** `initHardware` calls `setSampleBuffer` on
 `owner->getCaptureBuffer()->getBytesNoCopy()` for `kLatSOF_CapBufferSize` bytes.
-The engine's sample buffer *is* the DMA ring the DSP writes into. There is no
+The engine's sample buffer _is_ the DMA ring the DSP writes into. There is no
 copy layer and no second ring: the DSP writes where CoreAudio reads. The
 ring is allocated by `initDSP()` before the engine is ever constructed, and
 `initHardware` refuses to proceed if it is absent.
@@ -174,7 +174,7 @@ conflating them is an error the ear can hear:
   it to decide when the sound in a buffer actually reached the microphone.
 
 They answer different questions and must not be given the same value. An
-earlier revision reported the DPIB lag as the latency *as well* as absorbing it
+earlier revision reported the DPIB lag as the latency _as well_ as absorbing it
 in the offset and the back-dated timeline, which double-counts it: the
 consumers were told the audio was a further 100 ms older than the timeline
 already said it was.
@@ -182,7 +182,7 @@ already said it was.
 **Measuring the real latency.** The 240 frames above is a placeholder for the
 pipeline delay and should be replaced by a measurement. The obvious approach —
 play a burst, record it, subtract the output device's reported latency — fails,
-because the arrival timestamps come from *this driver's own clock model*. That
+because the arrival timestamps come from _this driver's own clock model_. That
 measures the suspect clock with the suspect clock, and duly returns physically
 impossible negative values. A valid measurement needs a second input device you
 trust (any USB microphone): capture the same burst on both in one run, and the
@@ -191,14 +191,14 @@ timestamps out of the loop. Until someone runs that, treat the number as
 provisional and do not build anything on it.
 
 **Timestamping, and why it is back-dated.** `takeTimeStamp` assumes the event
-being stamped is happening *now*. Neither of this engine's two stamp sites is.
+being stamped is happening _now_. Neither of this engine's two stamp sites is.
 `stampBackdated(incrementLoop, framesAgo)` therefore computes
 `now − framesAgo/48000` seconds and stamps that instead:
 
 - `wrapTimerFired` is a 100 ms `IOTimerEventSource` that watches
   `getCurrentSampleFrame()` (DPIB/8) for the position moving backwards, which on
   a ~341 ms ring happens exactly once per loop. It can notice the wrap up to a
-  full poll period after it happened, and the position it reads *is* the number
+  full poll period after it happened, and the position it reads _is_ the number
   of frames that have elapsed since — so it back-dates by exactly that.
 - `performAudioEngineStart` may find DMA already running (the gated start
   returns success immediately when `isCapturing`, e.g. a client retrying after
@@ -219,7 +219,7 @@ conversion in the same pass as a per-channel one-pole **DC-blocking high-pass**
 (`y[n] = x[n] − x[n−1] + R·y[n−1]`, `R = 0.98822` ≈ 90 Hz corner at 48 kHz)
 followed by gain and a clamp to ±1.0. This chain is the HAL plugin's, ported
 intact, including its ordering rationale: raw PDM output carries a DC offset,
-and filtering *before* gain keeps that offset from eating headroom. Denormals
+and filtering _before_ gain keeps that offset from eating headroom. Denormals
 are flushed, because a geometric decay into denormal range costs real CPU in a
 realtime path. Gain comes from an `IOAudioLevelControl` (0…+40 dB, default
 +30 dB — the plugin's fixed 32×, landing speech near −5 dBFS) and is converted
@@ -236,13 +236,13 @@ scratch copy of it.
 
 The subtlety is the initial value. A naive design requires `dcNextFrame == 0` to
 start — but the family's first read after a start lands at an arbitrary ring
-position, essentially never 0, so under that rule the state would *never*
+position, essentially never 0, so under that rule the state would _never_
 persist. Every IO block would restart the filter from zero, and every block
 would therefore begin with the filter re-converging out of a gain-amplified DC
 step: a periodic thump at IO-block rate that is indistinguishable from crackle
 in a listen test. The fix is the sentinel `kDCSeedPending` (`0xFFFFFFFF`),
 meaning "not yet seeded": `performAudioEngineStart` sets it along with zeroing
-the filter, and the first `convertInputSamples` call adopts *its own*
+the filter, and the first `convertInputSamples` call adopts _its own_
 `firstSampleFrame` as the expected frame.
 
 The wrap-split case then falls out for free, and it is worth checking that it
@@ -271,7 +271,7 @@ correct-looking code that fails only under a timing window.
 
 `performAudioEngineStart` calls `LatSOFAudioDevice::engineStartCapture()`, which
 is a **single** `commandGate->runAction(&s_engineStartCapture)`. Inside that one
-gate closure, `startCaptureGated()` runs *and*, if it fails, `gWasCapturing` is
+gate closure, `startCaptureGated()` runs _and_, if it fails, `gWasCapturing` is
 cleared:
 
 ```c
@@ -290,7 +290,7 @@ client could not re-ask, so a start refused during the wake window had to be
 remembered and re-armed later by the wake retry path. The family world is the
 opposite: `coreaudiod` re-issues `performAudioEngineStart` on client activity by
 design. A latch left armed here would have the wake path start capture DMA with
-no *Running* engine attached — and IOAudioFamily only delivers
+no _Running_ engine attached — and IOAudioFamily only delivers
 `performAudioEngineStop` to a Running engine, so nothing in the system could
 ever stop it. Headless DMA, self-re-arming across every subsequent sleep.
 
@@ -310,14 +310,14 @@ and this project believed the wrong thing about it for a long time.
 
 The facts below come from disassembling `AVFAudio` and `CoreSpeech` out of this
 machine's dyld shared cache (Sequoia 15.7.7). They are property tests, every one
-of them, and they are the *same* tests for a kext, for a userspace
+of them, and they are the _same_ tests for a kext, for a userspace
 `AudioServerPlugIn` and for a DriverKit driver:
 
 - `+[AVVCAudioDeviceManager IsDeviceBuiltIn:]` returns true only when the
   transport type is `'bltn'` **and** the first entry of the input-scope
   `kAudioDevicePropertyDataSources` (`'ssc#'`) is `'imic'`.
 - `+[AVVCAudioDeviceManager GetAudioDeviceBuiltInMicrophone]` — used by the
-  `'voic'` (Hey Siri) activation path — additionally requires the *current*
+  `'voic'` (Hey Siri) activation path — additionally requires the _current_
   input-scope `kAudioDevicePropertyDataSource` (`'ssrc'`) to read `'imic'`.
 - CoreSpeech's `CSSiriRecordingInfo` classifies the route by transport. A
   `'bltn'` device must present a data source of `'imic'` or `'emic'`, or the
@@ -354,7 +354,7 @@ answer before writing it, look there. `setDeviceModelName` and the stream's
 type defaults to 0, which reads as "not a microphone" to anything that asks.
 
 **A correction worth recording.** This project previously held that Siri
-filtered on device *class* — kernel IOAudioFamily devices admitted, userspace
+filtered on device _class_ — kernel IOAudioFamily devices admitted, userspace
 `AudioServerPlugIn` devices excluded — and the kernel port was undertaken on
 that basis. That belief was wrong. There is no class test anywhere in the path.
 The gate is HAL properties and nothing else, and the old HAL plugin almost
@@ -375,7 +375,7 @@ The missing tone is correct behaviour, not a regression.
 ## How the kext is loaded
 
 Linking `com.apple.iokit.IOAudioFamily` changed how this kext gets into the
-kernel, and the failure mode is *silent*, so it is worth being explicit.
+kernel, and the failure mode is _silent_, so it is worth being explicit.
 
 **OpenCore can no longer inject it.** Injected kexts are linked into the boot
 kernel collection and may resolve symbols only against that collection and
@@ -393,7 +393,7 @@ The kext now installs to `/Library/Extensions` and is linked into the
 sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
 ```
 
-`kmutil` answering that the change "requires a reboot" is the *success*
+`kmutil` answering that the change "requires a reboot" is the _success_
 message, not an error — the auxiliary collection is rebuilt and takes effect at
 the next boot. Note that `kmutil install --update-all`, the more commonly cited
 incantation, **fails on a hackintosh**: it demands a Kernel Debug Kit matching
@@ -403,7 +403,7 @@ obtainable. Use `load -p`.
 **The dependency floor must be 200.5.** `Info.plist` declares
 `com.apple.iokit.IOAudioFamily` = `200.5`. The `1.0.0b1` floor that older
 IOAudioFamily kexts carry will not link: the family's compatible version is
-`1.0`, and `1.0.0b1` sorts *below* `1.0`, so the requirement can never be
+`1.0`, and `1.0.0b1` sorts _below_ `1.0`, so the requirement can never be
 satisfied.
 
 **Consequence for the borrowed-stream contract.** Auxiliary-collection kexts
@@ -419,7 +419,7 @@ be what you are exercising.
 
 **A gap on that path, still open.** That ordering is benign only while
 AppleHDA is idle. Loading late also means this kext can be loaded while
-AppleHDA is actively *playing*, and `initDSP()` does not check for that before
+AppleHDA is actively _playing_, and `initDSP()` does not check for that before
 it takes SD7. Measured with audio running, `SD-Borrow` read `ctl=0x14001e` —
 `RUN | IOCE | FEIE | DEIE`, i.e. AppleHDA mid-stream — and the speakers
 produced immediate loud static, curable only by replugging the jack.
@@ -457,7 +457,7 @@ expired:
   counted ring wraps, back-dated to the wrap instant, smoothed by a 1/8
   correction filter. The back-dating is what the engine's wrap timer now does.
   Worth remembering, because it is the kind of thing that gets miscredited: that
-  design was *not* the fix for the playback failure described under "The
+  design was _not_ the fix for the playback failure described under "The
   interrupt-starvation bug" below. It was written chasing a clock-drift theory
   that a profiler disproved in one command, and kept because it is correct
   regardless (patch 13 in `history/README.md`).
@@ -486,7 +486,7 @@ nothing — and the BDL is one entry per 4 KB page, so `BCIS` latches roughly
 
 Nobody acknowledges any of it. AppleHDA's handler finds none of its own status
 bits set and returns not-handled. A few hundred unhandled interrupts later the
-kernel throttles the line — and that line is how AppleHDA receives *its*
+kernel throttles the line — and that line is how AppleHDA receives _its_
 interrupts. The result:
 
 - speakers cut out about 5-6 seconds into any sustained capture
@@ -521,7 +521,7 @@ Moving the loader elsewhere looks tempting and was tried. It failed at cold
 boot, and the reason is worth recording because it was initially misread as
 "the hardware demands SD7": the attempt changed the descriptor index but left
 the **stream tag** at 1 — and AppleHDA drives SD7 with tag 1 as well. The ROM
-binds its code-load gateway by *tag*, not by descriptor index, so that put two
+binds its code-load gateway by _tag_, not by descriptor index, so that put two
 output descriptors on one tag. Relocating the loader may well be viable, but
 only if the tag moves with it — and that is still untested, because the one
 attempt since then did not move the tag either.
@@ -546,7 +546,7 @@ and the mic was dead until the previous build was reinstalled.
 
 Read that result carefully, because it is easy to over-read. **Patch 28 moved
 the descriptor index and left `sTag` at 1**, exactly as the first attempt did,
-and the ROM is told which stream to receive on by *tag*:
+and the ROM is told which stream to receive on by _tag_:
 
 ```c
 wr32(dsp, IPC_HIPCIDR, IPC_BUSY | ROM_IPC_CONTROL | ROM_IPC_PURGE_FW | ((sTag - 1) << 9));
@@ -554,7 +554,7 @@ wr32(dsp, IPC_HIPCIDR, IPC_BUSY | ROM_IPC_CONTROL | ROM_IPC_PURGE_FW | ((sTag - 
 
 SD8 on tag 1 while AppleHDA still drives SD7 on tag 1 is the same collision as
 before, so the failure is already explained by the tag and says nothing new
-about the index. What *is* measured is narrower than "the hardware demands
+about the index. What _is_ measured is narrower than "the hardware demands
 SD7": **a free descriptor is not the missing piece.** Finding one buys nothing
 on its own.
 
@@ -582,13 +582,13 @@ Given the loan is unavoidable, the contract is:
 Concretely, in `initDSP()`: `SdSnapshot` captures `CTL`/`CBL`/`LVI`/`FMT`/`BDL`
 plus the shared `PPCTL` and SPIB state before the loader touches anything, and
 `sdRestore()` — idempotent, guarded by a `restored` flag — puts it back. It is
-called on the normal path *and* from `cleanup:`, so the ROM-IPC and INIT_DONE
+called on the normal path _and_ from `cleanup:`, so the ROM-IPC and INIT_DONE
 timeout paths, which jump straight over the normal hand-back, cannot leave
 AppleHDA's descriptor pointing at our firmware buffer.
 
 **Why this is easy to get wrong.** Cold boot forgives every violation. At boot
 SD7 is unprogrammed (`ctl=0x040000 fmt=0x0000 bdl=0 cbl=0 lvi=0`) — there is
-nothing there to damage, and AppleHDA configures it *after* us. On a wake it is
+nothing there to damage, and AppleHDA configures it _after_ us. On a wake it is
 fully live (`ctl=0x140000 fmt=0x4031 bdl=0x1f1d9000 cbl=393216 lvi=95`), and
 anything written after the hand-back destroys a running playback engine. So the
 bug is invisible until the machine sleeps, and it manifests in a driver you did
@@ -610,14 +610,14 @@ differing field names it. No inference required.
 
 ## The AFG keep-alive (patch-31)
 
-The one place this driver deliberately talks to the *codec* rather than the
+The one place this driver deliberately talks to the _codec_ rather than the
 DSP. AppleHDA drops the ALC236's Audio Function Group (node `0x01`) to D3
 when the output engine idles and — on the idle-jack-insert path — starts
 streaming without restoring it. Since the AFG is the parent of every widget,
 the headphone pin and DAC then sit at "requested D0, actually D3" and audio
 drives a powered-down chain: harsh static that only a replug (a full
 re-init) cured. Measured by diffing codec dumps: the static and clean states
-differ *only* in those power states; pin control, EAPD, amp gains, routing
+differ _only_ in those power states; pin control, EAPD, amp gains, routing
 and format are byte-identical.
 
 The correction is one verb, `SET_POWER_STATE D0` to node `0x01` — idempotent
@@ -625,7 +625,7 @@ and monotonic, so it can never leave two pieces of state disagreeing. What
 matters is the transport and the trigger:
 
 - **Transport: the Immediate Command Interface** (`ICOI/IRII/ICIS` at
-  `0x60/0x64/0x68`), *not* CORB/RIRB. The command ring belongs to AppleHDA,
+  `0x60/0x64/0x68`), _not_ CORB/RIRB. The command ring belongs to AppleHDA,
   and contending on it is the same shared-resource bet the borrowed-stream
   contract exists to manage. ICI is a separate, controller-arbitrated path:
   claim only when idle, bound every wait (~1 ms), bail silently on
@@ -635,7 +635,7 @@ matters is the transport and the trigger:
   job through AppleALC's user client).
 - **Triggers, all MMIO-detected from jackPoll's 500 ms tick.** Three, each
   the product of a failed hardware round: (1) any change of SD7's
-  BDL^CBL^FMT *signature* — an engine rebuild, which a state-class watcher
+  BDL^CBL^FMT _signature_ — an engine rebuild, which a state-class watcher
   misses because AppleHDA leaves SD7 programmed forever after first
   playback; (2) the headphone pin's jack-sense bit (`GET_PIN_SENSE 0x21`,
   polled only while the output is idle) — the plug itself, which SD7 cannot
@@ -655,7 +655,7 @@ matters is the transport and the trigger:
 
 - Capture DMA advances at exactly real-time rate (241k frames in 5.02 s).
 - 100 % nonzero samples, both channels live, on the first successful run.
-- Speaker playback verified working *during* capture (shared-function
+- Speaker playback verified working _during_ capture (shared-function
   coexistence) and after stop.
 - Sleep/wake: the kext rebuilds the DSP on wake, and the borrowed output
   descriptor comes back byte-identical. Verified over a cold boot plus four

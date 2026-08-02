@@ -63,6 +63,7 @@ with nothing plugged in.
   variable isn't already set, so also list `csr-active-config` under
   `NVRAM → Delete` for the same GUID (or reset NVRAM from the OpenCore boot
   menu). Reboot and re-run the check before continuing.
+
 - **Command Line Tools:**
 
   ```sh
@@ -162,7 +163,7 @@ You should see `com.hackintosh.LatSOFAudio` listed with
 
 > **Do not use `kmutil install --update-all`.** That subcommand rebuilds the
 > Boot and System collections and demands a Kernel Debug Kit matching your
-> exact macOS build — on a hackintosh it fails with *"Missing Developer Kit"*.
+> exact macOS build — on a hackintosh it fails with _"Missing Developer Kit"_.
 > `kmutil load -p` is the right command; it only touches the auxiliary
 > collection, which is where third-party kexts belong.
 
@@ -179,8 +180,8 @@ stage it until you give it. Do this:
 
 1. Open **System Settings → Privacy & Security**.
 2. **Scroll to the very bottom of that pane.** The approval row sits below
-   everything else and is easy to miss. (Some builds also post a *"System
-   Extension Blocked"* notification — same control, same place.)
+   everything else and is easy to miss. (Some builds also post a _"System
+   Extension Blocked"_ notification — same control, same place.)
 3. Click **Allow** and enter your password.
 4. Run the **same** `kmutil load -p` command again. It should now answer with
    the `Code=28` "requires a reboot" message above.
@@ -230,19 +231,19 @@ register values vary by machine — these are the reference laptop's):
 
 They are **not** textually identical — `SD-Final` reports three extra fields
 (`cbl`, `lvi`, `spiben`). The check is **field-for-field**: every field that
-appears in *both* lines (`ctl`, `fmt`, `bdl`, `ppctl`) must show the same
+appears in _both_ lines (`ctl`, `fmt`, `bdl`, `ppctl`) must show the same
 value in each. That's the proof AppleHDA's borrowed stream was handed back
 untouched — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 > **Status vocabulary since patches 30–32.** `"Status" = "OK"` is still the
 > pass, and a bare `FAILED: FW load` on a quiet cold boot still means roll
-> back. But three states that *look* alarming are working-as-designed:
+> back. But three states that _look_ alarming are working-as-designed:
 >
-> | Property | Meaning |
-> |---|---|
-> | `Status = "deferred: AppleHDA output busy at load"` | hot-load while audio was playing; the retry engine takes over — wait for a quiet moment |
-> | `Status = "deferred: retrying after FAILED: … (n/12)"` | a rebuild attempt failed with budget left; still in progress, not terminal |
-> | `Status = "FAILED: DSP init retries exhausted (last: …)"` | terminal for *this* round — but a sleep/wake or simply re-selecting the mic re-arms it (`Wake-Retry = "re-armed by capture demand"`) |
+> | Property                                                  | Meaning                                                                                                                              |
+> | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+> | `Status = "deferred: AppleHDA output busy at load"`       | hot-load while audio was playing; the retry engine takes over — wait for a quiet moment                                              |
+> | `Status = "deferred: retrying after FAILED: … (n/12)"`    | a rebuild attempt failed with budget left; still in progress, not terminal                                                           |
+> | `Status = "FAILED: DSP init retries exhausted (last: …)"` | terminal for _this_ round — but a sleep/wake or simply re-selecting the mic re-arms it (`Wake-Retry = "re-armed by capture demand"`) |
 >
 > Other properties worth knowing: `AFG-Probe` (proof the in-kernel codec
 > access works — appears on first playback), `AFG-Wake` (count of headphone
@@ -311,7 +312,7 @@ copies of the driver racing for the same hardware.
 > the running `AppleHDAPath::isAudioStreamSupported` confirmed the key is a
 > hard gate, not advisory. Consequences for this section:
 >
-> - `latsof-setrate` is still a fine one-shot *diagnostic* (`latsof-setrate`
+> - `latsof-setrate` is still a fine one-shot _diagnostic_ (`latsof-setrate`
 >   with no argument reports the rate), and the correct tool on machines
 >   running a stock layout.
 > - **Do not install the `--enforce` LaunchAgent** described at the end of
@@ -347,7 +348,7 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 > the one it fixed.** Measured on 29 July 2026:
 >
 > When the headphone jack is plugged in, AppleHDA rebuilds the output engine
-> and passes *through* 44,100 Hz before settling at 48,000 Hz on its own. A
+> and passes _through_ 44,100 Hz before settling at 48,000 Hz on its own. A
 > resident watcher that reacts to that transient writes 48,000 Hz **while the
 > codec path is still being programmed for 44,100** — leaving the stream and
 > the codec disagreeing. The result is harsh static on **both** headphones and
@@ -366,8 +367,9 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 >
 > **That safe version now exists** — `latsof-setrate --enforce 48000`, described
 > at the end of this section. It is built around exactly the rule above: it
-> reacts to *quiet*, never to change. Do not replace it with something that
+> reacts to _quiet_, never to change. Do not replace it with something that
 > writes the rate from a notification callback, which is what failed here.
+
 ### The `latsof-setrate` helper — install it once
 
 The rest of this section uses a small command-line tool that reports and pins
@@ -421,7 +423,7 @@ something —
 means it had no work to do, not that it failed.
 
 > **The tool also has a `--watch` mode. Never run it.** `latsof-setrate
-> --watch 48000` *is* the resident agent retracted above — it stays running
+--watch 48000` _is_ the resident agent retracted above — it stays running
 > and re-pins on every device change, including the 44.1 kHz transient that a
 > jack plug legitimately passes through, which is precisely how it produced
 > static on both outputs. It is kept in the source only so the negative result
@@ -437,7 +439,7 @@ means it had no work to do, not that it failed.
 ### The cold-boot case, and its 20-second cure
 
 Measured on the reference machine: if you **boot with headphones already
-plugged in**, the output engine can come up at 44,100 Hz and *stay* there.
+plugged in**, the output engine can come up at 44,100 Hz and _stay_ there.
 Replugging alone does not help — each replug rebuilds at 44.1 again — so the
 static appears permanent until the machine is slept and woken, which is when
 it lands on 48,000 Hz and goes clean. macOS stores 48,000 in
@@ -454,7 +456,7 @@ latsof-setrate 48000                                              # 1. pin
 
 Step 1 alone does nothing audible (a live rate switch never reprograms the
 codec path). Step 2 is what rebuilds the engine, and because the rate is
-already pinned, it rebuilds *at* 48 kHz. Sleep/wake achieves the same thing;
+already pinned, it rebuilds _at_ 48 kHz. Sleep/wake achieves the same thing;
 this is just faster. If you rarely boot with headphones connected, you will
 probably never meet this at all.
 
@@ -479,11 +481,11 @@ but it does **not** fix this particular problem — the sample rate does.
 There are two different faults that both sound like "headphone static", and
 fixing the first does nothing for the second:
 
-| | 44.1 kHz fault | dropout fault |
-|---|---|---|
-| Sounds like | constant, on every sound | occasional bursts, comes and goes |
-| Depends on | the sample rate | CPU load / power state |
-| Verify | `system_profiler SPAudioDataType \| grep SampleRate` | the log check below |
+|             | 44.1 kHz fault                                       | dropout fault                     |
+| ----------- | ---------------------------------------------------- | --------------------------------- |
+| Sounds like | constant, on every sound                             | occasional bursts, comes and goes |
+| Depends on  | the sample rate                                      | CPU load / power state            |
+| Verify      | `system_profiler SPAudioDataType \| grep SampleRate` | the log check below               |
 
 The second is CoreAudio missing an audio render deadline. Check for it:
 
@@ -517,7 +519,7 @@ the cure is instant.
 
 **This microphone is 48 kHz only.** The DSP pipeline runs at 48 kHz and the
 kernel engine publishes exactly that one rate — there is no 44.1 kHz to offer.
-Some apps nevertheless drag the *output* device to 44,100 Hz when a call
+Some apps nevertheless drag the _output_ device to 44,100 Hz when a call
 starts: FaceTime does this reliably, on the reference machine, even for
 audio-only calls. CoreAudio is then bridging a 48 kHz input engine and a 44.1
 kHz output engine for every buffer — sample-rate conversion plus drift
@@ -547,7 +549,7 @@ latsof-setrate 48000
 
 The overloads stop immediately and the crackle goes with them; on the reference
 machine the count went from roughly six per second to zero within the same
-second. Note that this is the one situation where a live rate change *is* the
+second. Note that this is the one situation where a live rate change _is_ the
 fix rather than a false lead: nothing here depends on reprogramming the codec
 path, only on the two engines agreeing on a rate. The rate reverts to 48 kHz by
 itself when the call ends.
@@ -558,7 +560,7 @@ on the same machine were clean throughout.
 ### Enforcing 48 kHz automatically
 
 Running the command by hand every time a call app pulls the rate down gets old.
-`--enforce` does it for you, and it is safe *because of how it is shaped*:
+`--enforce` does it for you, and it is safe _because of how it is shaped_:
 
 ```sh
 latsof-setrate --enforce 48000
@@ -569,10 +571,10 @@ eight-second timer; the rate is corrected solely once it has been wrong
 continuously for that long with nothing else happening. That separates the two
 cases exactly:
 
-| Situation | 44.1 kHz lasts | Enforcer |
-|---|---|---|
-| Headphone jack plugged in | under a second, settles by itself | never fires |
-| Call app holding the output down | the whole call | corrects once |
+| Situation                        | 44.1 kHz lasts                    | Enforcer      |
+| -------------------------------- | --------------------------------- | ------------- |
+| Headphone jack plugged in        | under a second, settles by itself | never fires   |
+| Call app holding the output down | the whole call                    | corrects once |
 
 The first row is the important one: writing the rate during a jack rebuild is
 what produced the harsh static described in the box above, so the enforcer is
@@ -657,6 +659,7 @@ not bugs.
    ```
 
    No output means you're on an old build; rebuild and reinstall.
+
 3. Check what Siri actually chose:
 
    ```sh
@@ -693,14 +696,14 @@ sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
 
 - **No listening tone when Siri opens.** macOS deliberately suppresses the beep
   for built-in microphones without hardware echo cancellation, so the mic can't
-  hear it. Real MacBooks behave the same way. If you *used* to hear the tone
+  hear it. Real MacBooks behave the same way. If you _used_ to hear the tone
   with a USB mic, that was the external-microphone code path.
 - **The log line `supported : 0`** next to your device ID. Ignore it. That
   check asks whether the device is an Apple Studio Display; every microphone in
   the world fails it.
 
 **Why this needed a kernel driver at all:** Siri only accepts a built-in-type
-device if it advertises an *input data source* of `'imic'` ("internal
+device if it advertises an _input data source_ of `'imic'` ("internal
 microphone"). USB devices skip that check entirely — which is why a USB mic
 always worked. The kext publishes the `'imic'` selector so the internal mics
 qualify. Details in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -709,7 +712,7 @@ qualify. Details in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### Updating to a new build
 
-Never copy a new kext *over* the installed one. Remove it, copy, then **prove**
+Never copy a new kext _over_ the installed one. Remove it, copy, then **prove**
 you actually got the new binary. Run this from the `kext/` directory `make`
 wrote to, as in step 4:
 
@@ -724,7 +727,7 @@ sudo kmutil load -p /Library/Extensions/LatSOFAudio.kext
 ```
 
 **The two `md5` lines are not paranoia.** On the reference machine on 29 July
-2026 the `ditto` printed no error and the *old* binary was still sitting in
+2026 the `ditto` printed no error and the _old_ binary was still sitting in
 `/Library/Extensions` — every later check looked fine and the fix under test
 simply wasn't there. The hash is what caught it. If the two hashes differ, the
 copy did not happen: confirm the old bundle was really removed, and that you
@@ -743,7 +746,7 @@ System Settings."
 Open System Settings → Privacy & Security, scroll to the **bottom**, click
 **Allow**, enter your password, then re-run the same `kmutil load -p` command
 — it should then give the `Code=28` "requires a reboot" message. This happens
-on every install *and every rebuild*, because the `csr-active-config` value
+on every install _and every rebuild_, because the `csr-active-config` value
 from step 0 (`0x803`) allows unsigned kexts but does not include the
 skip-approval bit. If you rebuild often and would rather never see the prompt,
 `0xA03` — `030a0000` in `config.plist` — adds that bit, at the cost of one more
@@ -755,9 +758,9 @@ load hijacks the running stream and you get immediate loud static from the
 speakers, curable only by physically replugging the jack. Stop playback first —
 or skip the live load entirely and just reboot.
 
-**Then reboot.** `kmutil showloaded` reports the kext that is *running*, which
+**Then reboot.** `kmutil showloaded` reports the kext that is _running_, which
 is still the old one until you restart — a new hash on disk together with the
-old build in `showloaded` is normal *before* the reboot and a bug *after* it.
+old build in `showloaded` is normal _before_ the reboot and a bug _after_ it.
 Check both.
 
 **After the reboot, verify — step 5's three checks, in the same order:**
@@ -770,7 +773,7 @@ system_profiler SPAudioDataType | grep -A8 "LatSOF DMIC"
 
 In order, you want: `com.hackintosh.LatSOFAudio (1.1.5)` followed by a UUID —
 and if you noted the old build's UUID before updating, this one must be
-*different*, which is your proof the running kext is the new one; then
+_different_, which is your proof the running kext is the new one; then
 `"Status" = "OK"`, with `SD-Borrow` and `SD-Final` naming the same stream and
 agreeing field-for-field (`sd7` on the reference laptop — the number varies by
 machine, and step 5 explains the comparison); then a `LatSOF DMIC capture`
@@ -794,7 +797,7 @@ sudo ditto /Library/Extensions/LatSOFAudio.kext ~/LatSOFAudio-known-good.kext
 ```
 
 Then roll back by running the update block with `~/LatSOFAudio-known-good.kext`
-as the `ditto` source. The `md5` check matters *more* here, not less: two
+as the `ditto` source. The `md5` check matters _more_ here, not less: two
 builds of this kext are indistinguishable from the outside, so the hash is the
 only thing that tells you which one you are running. If the approval prompt
 reappears, approve and re-run as above; either way, reboot and verify.
@@ -839,7 +842,7 @@ step 4; the KDK is never needed on this path.
 3. Did macOS block it? System Settings → Privacy & Security → **Allow**.
 4. Is ownership right? `ls -ld /Library/Extensions/LatSOFAudio.kext` must show
    `root wheel`.
-5. Are you accidentally *also* injecting it from EFI? Disable that entry
+5. Are you accidentally _also_ injecting it from EFI? Disable that entry
    (step 6).
 
 **Kext loaded but no microphone in Sound settings** —
@@ -855,6 +858,7 @@ firmware didn't load — wrong firmware generation (step 2) or wrong hardware
 ```sh
 ioreg -rc LatSOFKernelAudioEngine -w0 | grep IOAudioEngineState
 ```
+
 **`"Status" = "FAILED: FW load"`** — the DSP firmware did not load, and the
 microphone is dead however healthy everything else looks: the kext is loaded
 and there is nothing behind it. This is the specific case of the generic
@@ -867,7 +871,7 @@ ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "Status|Wake-Retry"
 If the mic died across a sleep/wake rather than at boot, you will also see
 `"Wake-Retry-Done" = "GAVE UP after 12 tries"`: the driver re-attempted the
 bring-up twelve times and the DSP never answered. If that command prints
-*nothing at all* while `kmutil showloaded` still lists the kext, the failure
+_nothing at all_ while `kmutil showloaded` still lists the kext, the failure
 happened during `start()` and macOS detached the device — the reason is only
 in the log then:
 
@@ -880,7 +884,7 @@ Causes, in order of likelihood: wrong firmware generation — it must be IPC3,
 the v2.2.x `sof-cml.ri`, not IPC4 (step 2); a truncated file or a copied
 symlink (step 2's 500–600 KB check); the board's mics aren't on the DSP at all
 (step 0 / [`PORTING.md`](PORTING.md)); or, if you have modified the source, a
-change to *which* stream descriptor the code loader borrows. Keep it on
+change to _which_ stream descriptor the code loader borrows. Keep it on
 `SD(numISS)`, AppleHDA's first output stream (`sd7` on the reference laptop) —
 scanning for a genuinely free descriptor instead has been tried, and it
 produces exactly this failure: the borrow looks perfect in ioreg and the
@@ -891,7 +895,6 @@ If this appeared right after installing a new build, put the previous `.kext`
 bundle back: `sudo rm -rf /Library/Extensions/LatSOFAudio.kext` first, then
 step 4 verbatim — `ditto` onto an existing bundle can silently leave the old
 binary in place. That separates a bad build from bad hardware in one reboot.
-
 
 **Two "internal microphone" entries / level meter dead** — you selected the
 device literally named "Internal Microphone", which is AppleHDA's codec path

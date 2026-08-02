@@ -55,17 +55,18 @@ more SIP bit lowered.
 
 Reboot, then pick **LatSOF DMIC capture** in System Settings → Sound → Input.
 
-> ### The kext does *not* go in your EFI
+> ### The kext does _not_ go in your EFI
 >
 > This is the one thing people get wrong, and it fails **silently** — no error
 > anywhere, the kext simply never loads.
 >
-> The driver depends on Apple's `IOAudioFamily`, which lives in the *System*
-> kernel collection. OpenCore injects into the *Boot* collection and can only
+> The driver depends on Apple's `IOAudioFamily`, which lives in the _System_
+> kernel collection. OpenCore injects into the _Boot_ collection and can only
 > link against that, so it drops the bundle without a word. Installing to
 > `/Library/Extensions` lets macOS's own linker — which can see every
 > collection — do the job. If you have an old `Kernel → Add` entry for
 > `LatSOFAudio.kext`, disable it.
+
 ## Updating to a newer build
 
 Don't copy a new kext over the old one — remove it first, and check the hash.
@@ -96,7 +97,7 @@ Quit anything that's playing audio before you load. Loading the kext while
 AppleHDA is mid-stream can hijack that stream and produce loud static on the
 speakers, curable only by physically replugging the jack.
 
-Then reboot — `kmutil showloaded` reports the kext that is *running*, which is
+Then reboot — `kmutil showloaded` reports the kext that is _running_, which is
 the old one until you do; `kmutil inspect` is what shows you the bundle staged
 on disk. Verify with the three checks in [`INSTALL.md`](INSTALL.md) §5. Keep the
 previous bundle: rolling back is this same procedure with the old kext
@@ -104,12 +105,12 @@ previous bundle: rolling back is this same procedure with the old kext
 
 ## Which name is which
 
-| You will see | What it is |
-|---|---|
-| `LatSOFAudio.kext` | the driver — goes in **`/Library/Extensions`**, not your EFI |
-| `LatSOFAudioDevice` | the hardware/DSP IOKit class — what you query with `ioreg` |
-| `LatSOFKernelAudioDevice` | the audio device it publishes to CoreAudio |
-| **LatSOF DMIC capture** | the input device you select in Sound settings |
+| You will see               | What it is                                                                                                                                                      |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LatSOFAudio.kext`         | the driver — goes in **`/Library/Extensions`**, not your EFI                                                                                                    |
+| `LatSOFAudioDevice`        | the hardware/DSP IOKit class — what you query with `ioreg`                                                                                                      |
+| `LatSOFKernelAudioDevice`  | the audio device it publishes to CoreAudio                                                                                                                      |
+| **LatSOF DMIC capture**    | the input device you select in Sound settings                                                                                                                   |
 | `LatSOFAudioPlugin.driver` | **retired.** The old userspace HAL plugin, replaced by the kernel audio engine. Source kept under `plugin/` for reference; do not install it alongside the kext |
 
 ## How it works (short version)
@@ -152,8 +153,8 @@ here it is in full.
 macOS decides whether a microphone is acceptable to Siri like this:
 
 - If the device's **transport type** is `'usb '`, `'blue'` or `'line'`, it is
-  accepted with no further questions. *This is the only reason USB microphones
-  always work.*
+  accepted with no further questions. _This is the only reason USB microphones
+  always work._
 - If the transport type is `'bltn'` (built-in), the device must **also**
   publish an input-scope **data source** of `'imic'` (internal microphone) —
   otherwise CoreSpeech nils the route and the panel says **"Siri Not Available
@@ -179,8 +180,8 @@ Two traps for anyone debugging this themselves:
   your bug.
 
 An earlier version of this README asserted that Siri admits only
-kernel-published devices and rejects userspace `AudioServerPlugIn` devices *by
-class*. **That was wrong.** The gate is purely HAL properties, and is identical
+kernel-published devices and rejects userspace `AudioServerPlugIn` devices _by
+class_. **That was wrong.** The gate is purely HAL properties, and is identical
 for kexts, HAL plugins and DriverKit drivers — the old plugin here failed for
 want of an `'imic'` data source, not for being userspace. The kernel port is
 still the right destination (AMFI blocks the unsigned plugin on this machine,
@@ -195,7 +196,7 @@ cancellation so the mic can't hear itself. Real MacBooks do the same.
 Intelligence & Siri → Siri Responses → turn on **Voice feedback**. It is off by
 default on some installs.
 
-**If Siri hears nothing on *any* microphone,** check DNS before blaming audio:
+**If Siri hears nothing on _any_ microphone,** check DNS before blaming audio:
 `dscacheutil -q host -a name guzzoni.apple.com`. A poisoned cache entry
 pointing Siri's speech endpoint at `0.0.0.0` fails every request server-side.
 Fix with `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`.
@@ -207,12 +208,12 @@ Fix with `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`.
 > machines.** The reference machine runs a custom AppleALC layout
 > (`alcid=92`, built by `contrib/alc236-layout91-rebuild.sh`) that sets
 > `MinimumSampleRate = 48000` on the output-path nodes. AppleHDA then never
-> *publishes* 44.1 kHz — verified by disassembling `AppleHDAPath::
-> isAudioStreamSupported` in the running kernel collection — so CoreAudio
+> _publishes_ 44.1 kHz — verified by disassembling `AppleHDAPath::
+isAudioStreamSupported` in the running kernel collection — so CoreAudio
 > cannot select it: no stuck cold boots, no rate roulette on replug, and
 > call apps physically cannot drag the output down. No resident enforcer,
 > nothing to keep running. `latsof-setrate` remains useful only as a
-> one-shot *diagnostic* on machines still running a stock layout.
+> one-shot _diagnostic_ on machines still running a stock layout.
 >
 > A second, rarer static — a jack event landing on an idle engine — turned
 > out to be an entirely different fault (the codec's Audio Function Group
@@ -223,19 +224,19 @@ Static or crackling from the 3.5 mm jack on ALC laptops is almost always the
 classic **44.1 kHz problem**: set the output to **48,000 Hz** in Audio MIDI
 Setup.
 
-**The trap:** changing the rate live is *not* a valid test. The codec path is
+**The trap:** changing the rate live is _not_ a valid test. The codec path is
 only fully reprogrammed when the audio engine is rebuilt, so you must **sleep
 and wake the machine, unplug and replug the jack, or reboot** before judging
 whether it worked. A live switch produces a false negative that cost this
 project an evening.
 
 **Booting with headphones already plugged in** is the case where the engine
-can come up at 44.1 kHz and *stay* there — replugging alone just rebuilds at
-44.1 again. The order is the whole trick: pin 48 kHz *first*, replug *after*.
+can come up at 44.1 kHz and _stay_ there — replugging alone just rebuilds at
+44.1 again. The order is the whole trick: pin 48 kHz _first_, replug _after_.
 Full procedure in [`INSTALL.md`](INSTALL.md) §7.
 
 **Automating the pin is possible, but only one way.** Plugging the jack makes
-AppleHDA rebuild the engine, and it passes *through* 44.1 kHz before settling
+AppleHDA rebuild the engine, and it passes _through_ 44.1 kHz before settling
 at 48 kHz by itself. A watcher that "corrects" that transient writes the rate
 while the codec is still being programmed, leaving stream and codec
 disagreeing — harsh static on headphones **and** speakers, curable only by
@@ -244,7 +245,7 @@ automation caused a worse fault than the one it fixed, and was retracted.
 
 `latsof-setrate --enforce 48000` is the rewrite, and it is safe because it
 **reacts to quiet rather than to change**: notifications only restart a timer,
-and the rate is corrected solely after it has been wrong *continuously* for
+and the rate is corrected solely after it has been wrong _continuously_ for
 eight seconds. A jack plug settles long before that and never triggers it; a
 call app holding the output at 44.1 does, and gets corrected once. Both
 behaviours were verified before it shipped. On a machine running the minrate
@@ -259,13 +260,13 @@ engine rebuild does.
 sample rate does.
 
 **If it still crackles at 48 kHz, it's a different fault.** Constant static on
-every sound is the rate problem above; *occasional* bursts that come and go are
+every sound is the rate problem above; _occasional_ bursts that come and go are
 CoreAudio missing render deadlines — usually caused by CPU throttling under
 Low Power Mode or a low battery, not by audio configuration at all. Both the
 log check and the fix are in [`INSTALL.md`](INSTALL.md) §7.
 
 **Crackling in FaceTime and other call apps is a third fault, with an instant
-cure.** This microphone is 48 kHz only, and some apps drag the *output* to
+cure.** This microphone is 48 kHz only, and some apps drag the _output_ to
 44.1 kHz when a call starts. CoreAudio then bridges two engines running at
 different rates and its IO thread misses deadlines — measured at 746 overloads
 in 60 seconds during a FaceTime call, all from FaceTime's own audio daemon on
@@ -279,7 +280,7 @@ reprogramming the codec — only on the two engines agreeing. Full details in
 
 Everything in this tree carries the `LatSOF` prefix — bundle, identifiers,
 classes, files. The parent project it derives from is DexterSLamb's
-**CmlSOFAudio** (*Cml* for Comet Lake); that name appears in this repository
+**CmlSOFAudio** (_Cml_ for Comet Lake); that name appears in this repository
 only when referring to the parent. Attribution lives in
 [`CREDITS.md`](CREDITS.md), [`NOTICE`](NOTICE), and the plugin's source header.
 
@@ -297,7 +298,7 @@ only when referring to the parent. Attribution lives in
 - **The SOF firmware blob, which is not in this repo** — see "Firmware" below.
   The kext will not build without it.
 - **No** `amfi=0x80`, **no** library-validation overrides — the driver runs
-  under stock enforcement. In fact `amfi=0x80` will *break* microphone
+  under stock enforcement. In fact `amfi=0x80` will _break_ microphone
   permission prompts system-wide; if something else in your EFI needs AMFI
   relaxed (OCLP-patched Wi-Fi is the usual culprit), use
   [AMFIPass](https://github.com/acidanthera/AMFIPass) instead.
@@ -308,22 +309,22 @@ Everything in this repository was developed and tested on exactly one machine.
 If yours differs, `PORTING.md` §0 is the five-minute Linux check that matters
 far more than matching this list.
 
-| | |
-|---|---|
-| Model | Dell Latitude 3410 (SKU `09EC`), board `0MYG77` rev A00 |
-| BIOS | 1.36.0, 07 Aug 2025 |
-| CPU | Intel Core i5-10210U — Comet Lake-U, 4 cores / 8 threads, 1.60 GHz base |
-| Host bridge | Comet Lake-U v1 4c `[8086:9b61]` |
-| Graphics | Intel UHD Graphics, CometLake-U GT2 `[8086:9b41]` — **integrated only, no discrete GPU** |
-| Memory | 2 × 8 GB DDR4-2400 (16 GB) |
-| Audio controller | Comet Lake PCH-LP cAVS `[8086:02c8]`, subsystem `[1028:09ec]` |
-| Codec | Realtek ALC3204 (ALC236 family, `[10ec:0236]`) at HDA address 0 |
-| Microphones | 2 × PDM DMIC on one PDM controller, wired to the DSP — **not to the codec** |
-| Storage | SanDisk WD PC SN5000S M.2 2280 NVMe `[15b7:5036]` |
-| Ethernet | Realtek RTL8111/8168 `[10ec:8168]` |
-| Wi-Fi / BT | Intel Wi-Fi 6 AX201 (CNVi) `[8086:02f0]`, subsystem `[8086:4070]` |
-| macOS | Sequoia 15.7.7 (24G720) |
-| SMBIOS | `MacBookPro16,2` |
+|                  |                                                                                          |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| Model            | Dell Latitude 3410 (SKU `09EC`), board `0MYG77` rev A00                                  |
+| BIOS             | 1.36.0, 07 Aug 2025                                                                      |
+| CPU              | Intel Core i5-10210U — Comet Lake-U, 4 cores / 8 threads, 1.60 GHz base                  |
+| Host bridge      | Comet Lake-U v1 4c `[8086:9b61]`                                                         |
+| Graphics         | Intel UHD Graphics, CometLake-U GT2 `[8086:9b41]` — **integrated only, no discrete GPU** |
+| Memory           | 2 × 8 GB DDR4-2400 (16 GB)                                                               |
+| Audio controller | Comet Lake PCH-LP cAVS `[8086:02c8]`, subsystem `[1028:09ec]`                            |
+| Codec            | Realtek ALC3204 (ALC236 family, `[10ec:0236]`) at HDA address 0                          |
+| Microphones      | 2 × PDM DMIC on one PDM controller, wired to the DSP — **not to the codec**              |
+| Storage          | SanDisk WD PC SN5000S M.2 2280 NVMe `[15b7:5036]`                                        |
+| Ethernet         | Realtek RTL8111/8168 `[10ec:8168]`                                                       |
+| Wi-Fi / BT       | Intel Wi-Fi 6 AX201 (CNVi) `[8086:02f0]`, subsystem `[8086:4070]`                        |
+| macOS            | Sequoia 15.7.7 (24G720)                                                                  |
+| SMBIOS           | `MacBookPro16,2`                                                                         |
 
 The two rows that actually decide whether this project applies to you are
 **Microphones** and **Codec**. On this board the ALC236 has no analog

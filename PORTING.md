@@ -98,15 +98,15 @@ Everything in the code that belongs to the Dell Latitude 3410 rather than
 to the design. If you port, this is the checklist; search for the symbol
 named.
 
-| Value | Where | What it means | Getting yours | 3410 value |
-|---|---|---|---|---|
-| Capture channels | `kLatSOF_CapChannels` in `kext/LatSOFAudio/LatSOFAudioDevice.hpp` | how many DMIC channels the pipeline captures | the channel count that worked in your §0 Linux test / your NHLT | 2 |
-| PDM clock window | the `pdmclk` fields of the DAI_CONFIG IPC — search `pdmclk` in `LatSOFAudioDevice.cpp` | allowed DMIC clock range the firmware may pick from | start with the canonical CML window 500000–4800000; narrow only if needed | min narrowed to 2400000 |
-| Stream engine + tag | `capIdx` / `capTag` in `LatSOFAudioDevice.cpp` | which HDA input DMA engine and stream tag this driver uses — must not collide with AppleHDA | use the HIGHEST input descriptor GCAP advertises: AppleHDA allocates input streams from the bottom, one per input engine the codec layout publishes, and dead pins still get real DMA engines. SD1 "looked safe" here until a second input engine trampled it (patch-32) | SD6, tag 7 |
-| Loader stream + tag | `sIdx` / `sTag` in `initDSP()` | which **output** engine carries firmware loads. `SD(numISS)` is AppleHDA's first output engine, and the ROM binds the code-load gateway by *tag* — this is a **borrow**, not a free descriptor, governed by the contract in §5 | derived from `GCAP` (`sIdx = numISS`); do not relocate without moving the tag too | SD7, tag 1 |
-| DMIC topology payloads | `kext/LatSOFAudio/tplg_ipc_data.h` | the captured IPC topology stream — recorded by the parent project from a working Linux session on the donor C1030 — with the DMIC/DAI messages adapted to this board's NHLT | adapt the DMIC/DAI messages to **your** NHLT (`sudo cat /sys/firmware/acpi/tables/NHLT > nhlt.bin` under Linux), or capture your own stream the same kprobe way — either path is the substantive porting work, see §3 | this board's NHLT |
-| Device names | `setDeviceName` / `setDeviceShortName` / `setManufacturerName` / `setDeviceModelName` calls in `LatSOFKernelAudioDevice::initHardware`, and `setDescription` in `LatSOFKernelAudioEngine::initHardware` (`kext/LatSOFAudio/LatSOFKernelAudio.cpp`) | the `initHardware` calls set the device identity seen in `ioreg` (IOAudioDeviceName) and the manufacturer/model strings; **the name Sound settings displays is the engine's `setDescription`** ("LatSOF DMIC capture") | cosmetic — change freely. Do **not** touch the transport type or the `'imic'` input selector next to them: those are what make Siri accept the device | ioreg: "LatSOF Internal Microphone"; Sound settings: "LatSOF DMIC capture" |
-| Controller identity | located by registry walk on the HDA controller at `00:1f.3` | where BAR4 and the DSP live | your §0 `lspci` check — must be `8086:02c8` | `8086:02c8` |
+| Value                  | Where                                                                                                                                                                                                                                              | What it means                                                                                                                                                                                                                  | Getting yours                                                                                                                                                                                                                                                            | 3410 value                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| Capture channels       | `kLatSOF_CapChannels` in `kext/LatSOFAudio/LatSOFAudioDevice.hpp`                                                                                                                                                                                  | how many DMIC channels the pipeline captures                                                                                                                                                                                   | the channel count that worked in your §0 Linux test / your NHLT                                                                                                                                                                                                          | 2                                                                          |
+| PDM clock window       | the `pdmclk` fields of the DAI_CONFIG IPC — search `pdmclk` in `LatSOFAudioDevice.cpp`                                                                                                                                                             | allowed DMIC clock range the firmware may pick from                                                                                                                                                                            | start with the canonical CML window 500000–4800000; narrow only if needed                                                                                                                                                                                                | min narrowed to 2400000                                                    |
+| Stream engine + tag    | `capIdx` / `capTag` in `LatSOFAudioDevice.cpp`                                                                                                                                                                                                     | which HDA input DMA engine and stream tag this driver uses — must not collide with AppleHDA                                                                                                                                    | use the HIGHEST input descriptor GCAP advertises: AppleHDA allocates input streams from the bottom, one per input engine the codec layout publishes, and dead pins still get real DMA engines. SD1 "looked safe" here until a second input engine trampled it (patch-32) | SD6, tag 7                                                                 |
+| Loader stream + tag    | `sIdx` / `sTag` in `initDSP()`                                                                                                                                                                                                                     | which **output** engine carries firmware loads. `SD(numISS)` is AppleHDA's first output engine, and the ROM binds the code-load gateway by _tag_ — this is a **borrow**, not a free descriptor, governed by the contract in §5 | derived from `GCAP` (`sIdx = numISS`); do not relocate without moving the tag too                                                                                                                                                                                        | SD7, tag 1                                                                 |
+| DMIC topology payloads | `kext/LatSOFAudio/tplg_ipc_data.h`                                                                                                                                                                                                                 | the captured IPC topology stream — recorded by the parent project from a working Linux session on the donor C1030 — with the DMIC/DAI messages adapted to this board's NHLT                                                    | adapt the DMIC/DAI messages to **your** NHLT (`sudo cat /sys/firmware/acpi/tables/NHLT > nhlt.bin` under Linux), or capture your own stream the same kprobe way — either path is the substantive porting work, see §3                                                    | this board's NHLT                                                          |
+| Device names           | `setDeviceName` / `setDeviceShortName` / `setManufacturerName` / `setDeviceModelName` calls in `LatSOFKernelAudioDevice::initHardware`, and `setDescription` in `LatSOFKernelAudioEngine::initHardware` (`kext/LatSOFAudio/LatSOFKernelAudio.cpp`) | the `initHardware` calls set the device identity seen in `ioreg` (IOAudioDeviceName) and the manufacturer/model strings; **the name Sound settings displays is the engine's `setDescription`** ("LatSOF DMIC capture")         | cosmetic — change freely. Do **not** touch the transport type or the `'imic'` input selector next to them: those are what make Siri accept the device                                                                                                                    | ioreg: "LatSOF Internal Microphone"; Sound settings: "LatSOF DMIC capture" |
+| Controller identity    | located by registry walk on the HDA controller at `00:1f.3`                                                                                                                                                                                        | where BAR4 and the DSP live                                                                                                                                                                                                    | your §0 `lspci` check — must be `8086:02c8`                                                                                                                                                                                                                              | `8086:02c8`                                                                |
 
 Everything not in this table is design, not configuration — if you find
 yourself changing it, read `ARCHITECTURE.md` first.
@@ -128,7 +128,7 @@ symptom list in §4.
 ## 4. Order of debugging when capture is silent
 
 1. Start/stop IPCs return 0 but position never moves → the decouple did
-   not hit *your* descriptor (check `PPCTL`), or the descriptor is
+   not hit _your_ descriptor (check `PPCTL`), or the descriptor is
    contended.
 2. Position advances, samples all zero → BIOS mic switch; then PDM clock
    range (§3); then your NHLT-derived DAI config.
@@ -136,12 +136,12 @@ symptom list in §4.
    channel count), `-ENOMEM` = shrink period/buffer sizes, `-EBUSY` =
    stream-tag collision with AppleHDA.
 4. Speakers die during experiments → you left something unacknowledged on the
-   shared interrupt line. Reboot, then read the IPC section *and* "The
+   shared interrupt line. Reboot, then read the IPC section _and_ "The
    interrupt-starvation bug" in `ARCHITECTURE.md`.
 5. **Playback dies a few seconds into a long capture**, the volume keys stop
    responding, and everything recovers when capture stops → stream-descriptor
    interrupts are enabled and unserviced. See §3b. This one presents as an
-   *output* fault: `coreaudiod` logs `HALS_IOA1Engine::EndWriting` with
+   _output_ fault: `coreaudiod` logs `HALS_IOA1Engine::EndWriting` with
    `0xE00002EE` against AppleHDA's output engine and burns 20%+ CPU, while your
    capture keeps working perfectly. Profile `coreaudiod` before assuming the
    CPU is yours — `sudo sample coreaudiod 10`, then grep the output for your
@@ -153,13 +153,13 @@ symptom list in §4.
 7. **Cold boot works perfectly; audio breaks only after sleep** — and which
    half breaks (mic, speakers, both) varies between wakes. This is the
    hardest symptom on this list to attribute, and it cost a full day here:
-   it is the borrowed loader descriptor being written *after* the
+   it is the borrowed loader descriptor being written _after_ the
    hand-back. At boot that descriptor is empty and AppleHDA programs it
    after you, so every violation is free; after a wake it is fully live,
    and anything you write destroys a running playback engine. Diff
    `SD-Borrow` against `SD-Final` in ioreg — if they differ, the differing
    field names the write. If they match and audio still broke, distrust
-   any success telemetry emitted before the function's *last* write to the
+   any success telemetry emitted before the function's _last_ write to the
    descriptor; ours lied for a week that way. Treat mic-death and
    speaker-death as two bugs, not one. Full story: Phase 13 in
    `DEBUGGING-LOG.md`; the rule that ends it: "The borrowed-stream
@@ -172,14 +172,14 @@ symptom list in §4.
 - Never write `PPCTL` bit 0, and never touch AppleHDA's descriptors in
   steady state. There is exactly **one** sanctioned exception, and your port
   cannot avoid it: the DSP's code loader must run over an output stream
-  descriptor, and the ROM binds its code-load gateway by *stream tag* — on
+  descriptor, and the ROM binds its code-load gateway by _stream tag_ — on
   this hardware that meant borrowing AppleHDA's first output engine,
   `SD(numISS)`, for the duration of every firmware load. If you borrow, you
   are bound by the borrowed-stream contract: snapshot the descriptor (and
   SPIB/PPCTL) once, restore through one idempotent function called from
   **every** exit path including the timeouts, and never write the
   descriptor again after the hand-back. Publish before/after telemetry
-  read *after* your last write (`SD-Borrow`/`SD-Final` here) and require
+  read _after_ your last write (`SD-Borrow`/`SD-Final` here) and require
   them identical. Read "The borrowed-stream contract" in `ARCHITECTURE.md`
   before writing a single line of loader code — violating it produces
   symptom 7 in §4, the one that only appears after sleep.
