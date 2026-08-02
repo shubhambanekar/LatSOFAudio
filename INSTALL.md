@@ -133,6 +133,13 @@ ownership, so even under `sudo` the copy arrives owned by your account
 (`yourname:staff`) — and `kmutil` refuses to load a kext in
 `/Library/Extensions` that isn't `root:wheel`.
 
+> **Already have a copy in `/Library/Extensions`? Do not run this block.** Use
+> §9's update block instead — it removes the old bundle first and proves the
+> copy with `md5`. A `ditto` onto an existing bundle has been observed here to
+> report success and leave the **old** binary in place, which cost a debugging
+> session on 29 July 2026. Once you have installed once, every later install is
+> an update.
+
 Run this from the `kext/` directory where `make` left `LatSOFAudio.kext` — if
 you opened a new terminal since step 3, `cd` back first (e.g.
 `cd ~/LatSOFAudio/kext`):
@@ -237,13 +244,19 @@ untouched — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 > **Status vocabulary since patches 30–32.** `"Status" = "OK"` is still the
 > pass, and a bare `FAILED: FW load` on a quiet cold boot still means roll
-> back. But three states that _look_ alarming are working-as-designed:
+> back. But several states that _look_ alarming are working-as-designed:
 >
-> | Property                                                  | Meaning                                                                                                                              |
-> | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-> | `Status = "deferred: AppleHDA output busy at load"`       | hot-load while audio was playing; the retry engine takes over — wait for a quiet moment                                              |
-> | `Status = "deferred: retrying after FAILED: … (n/12)"`    | a rebuild attempt failed with budget left; still in progress, not terminal                                                           |
-> | `Status = "FAILED: DSP init retries exhausted (last: …)"` | terminal for _this_ round — but a sleep/wake or simply re-selecting the mic re-arms it (`Wake-Retry = "re-armed by capture demand"`) |
+> | Property                                                   | Meaning                                                                                                                                                                                                                                                                                                                              |
+> | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+> | `Status = "deferred: AppleHDA output busy at load"`        | the output descriptor was busy at load; the retry engine takes over. Under the default `latsof_strictborrow=1` a merely-_programmed_ SD7 never frees again this session, so this is **not** a wait for quiet — it is bounded at `kProgrammedWaitRounds` × 1.5 s ≈ 30 s, after which it borrows anyway and publishes `Borrow-Warning` |
+> | `Status = "deferred: output became busy before borrow"`    | the descriptor changed state between preflight and borrow, and the attempt bailed before writing anything. **Both `SD-Borrow` and `SD-Final` are normally absent** — the bail happens before `SD-Borrow` is written                                                                                                                  |
+> | `Status = "deferred: init attempt n/12 failed — retrying"` | a rebuild attempt failed with budget left; still in progress                                                                                                                                                                                                                                                                         |
+> | `Status = "deferred: retrying after FAILED: … (n/12)"`     | same, carrying the underlying failure forward                                                                                                                                                                                                                                                                                        |
+> | `Status = "FAILED: DSP init retries exhausted (last: …)"`  | terminal for _this_ round — but a sleep/wake or simply re-selecting the mic re-arms it (`Wake-Retry = "re-armed by capture demand"`)                                                                                                                                                                                                 |
+> | `Wake-Retry = "deferred: SD7 programmed"`                  | the wake-path equivalent of row 1                                                                                                                                                                                                                                                                                                    |
+>
+> **Any `Status` beginning `deferred:` is in-progress, never terminal.** Only a
+> bare `FAILED: …` is a verdict.
 >
 > Other properties worth knowing: `AFG-Probe` (proof the in-kernel codec
 > access works — appears on first playback), `AFG-Wake` (count of headphone
@@ -270,10 +283,20 @@ LatSOF DMIC capture:
   Input Source: Internal Microphone
 ```
 
-**Now test it:** System Settings → Sound → Input. **You may see two input
-devices** — pick **LatSOF DMIC capture**. The other one, plainly named
-"Internal Microphone", is AppleHDA's codec path and records only silence on
-this hardware; its presence is expected, not a fault. Speak and watch the
+**Now test it:** System Settings → Sound → Input. **You will see more input
+devices than this laptop has microphones** — pick **LatSOF DMIC capture**. The
+others are AppleHDA's codec paths: **Built-in Microphone**, which records only
+silence here because no mic is wired to the codec, and — on the minrate layout
+from §7 (`alcid=92`), which publishes two input engines — also **Built-in Line
+Input**, the combo jack's mic half. Their presence is expected and they
+**cannot be removed**; see the box at the top of §7.
+
+**Do not use the `Input Source` field to tell them apart:** it reads
+`Internal Microphone` for **LatSOF DMIC capture** too, as the block above
+shows. Go by the device name. Since patch-32 moved capture to SD6, selecting
+one of the codec inputs and switching back no longer wedges the driver.
+
+Speak and watch the
 level meter move, then try Dictation (press the dictation key or Edit → Start
 Dictation) and say a sentence.
 
@@ -342,6 +365,12 @@ live switch will falsely tell you the sample rate wasn't the problem.
 **The fix:** Open **Audio MIDI Setup** (Applications → Utilities), select your
 output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 
+> **Use lid-close sleep.** On the reference machine, sleeping from the Apple
+> menu fails with an EFI/Bootrom `0x1F` error and costs a reboot; closing the
+> lid sleeps normally. This is an open OpenCore issue on this board, unrelated
+> to audio — `config-noonln.plist` is staged as a candidate fix but is
+> untested. Wherever this guide says "sleep and wake", close the lid.
+
 > ### Do NOT automate this with a resident rate-pinning agent
 >
 > This was tried on the reference machine, and it **caused a worse fault than
@@ -371,6 +400,10 @@ output device, set Format to **48,000 Hz**, then sleep and wake the machine.
 > writes the rate from a notification callback, which is what failed here.
 
 ### The `latsof-setrate` helper — install it once
+
+> **Stock-layout machines only.** On the minrate layout (`alcid=92` — see the
+> box at the top of §7) 44.1 kHz is never published, so the fault below cannot
+> occur. Kept as a field guide for machines running a stock AppleALC layout.
 
 The rest of this section uses a small command-line tool that reports and pins
 the analog output's sample rate. It is under 200 lines of CoreAudio: no
@@ -422,21 +455,26 @@ something —
 — and **prints nothing at all when the rate is already correct**: silence
 means it had no work to do, not that it failed.
 
-> **The tool also has a `--watch` mode. Never run it.** `latsof-setrate
---watch 48000` _is_ the resident agent retracted above — it stays running
-> and re-pins on every device change, including the 44.1 kHz transient that a
-> jack plug legitimately passes through, which is precisely how it produced
-> static on both outputs. It is kept in the source only so the negative result
-> stays reproducible. Not from a LaunchAgent, not from a login item, not in a
-> terminal tab you leave open.
+> **`--watch` is an alias for `--enforce`, not the retracted agent.**
+> `contrib/latsof-setrate.c:268-270` parses both flags identically into the
+> same debounced, quiet-triggered path — the source comment on that line reads
+> "same safe mode now". The dangerous version, which re-pinned from a
+> notification callback and produced static on both outputs, was removed in
+> `05289f3`/`2c677c6` and exists only in git history. Running `--watch`
+> therefore **cannot** reproduce the fault described above. (An earlier
+> revision of this box said the opposite; it predated those commits.)
 >
-> The comment block at the top of `contrib/latsof-setrate.c` agrees: it
-> documents `--watch` only as an alias, and closes with "No LaunchAgent, and
-> nothing to keep running." (Earlier revisions of this paragraph warned that
-> the source still recommended a `KeepAlive` LaunchAgent — that was true
-> before `2c677c6` and is no longer.)
+> Either flag still starts a **resident process**, which is a separate question
+> from whether it is safe. See "Enforcing 48 kHz automatically" below — and
+> skip that subsection entirely if you built the minrate layout, where 44.1 kHz
+> is unpublishable and there is nothing to enforce. The reference machine runs
+> no resident rate agent.
 
 ### The cold-boot case, and its 20-second cure
+
+> **Stock-layout machines only.** On the minrate layout (`alcid=92` — see the
+> box at the top of §7) 44.1 kHz is never published, so the fault below cannot
+> occur. Kept as a field guide for machines running a stock AppleALC layout.
 
 Measured on the reference machine: if you **boot with headphones already
 plugged in**, the output engine can come up at 44,100 Hz and _stay_ there.
@@ -476,10 +514,38 @@ see "The `latsof-setrate` helper" above.)
 `CodecCommander.kext` is also worth having in your EFI for jack-related pops,
 but it does **not** fix this particular problem — the sample rate does.
 
-### If crackle persists at 48 kHz — the other cause
+### If crackle persists at 48 kHz — the other causes
 
-There are two different faults that both sound like "headphone static", and
-fixing the first does nothing for the second:
+> **Only the rate fault above is layout-scoped.** Everything in this
+> subsection is layout-independent and applies on the minrate layout too.
+
+Three different faults all sound like "headphone static", and fixing one does
+nothing for the others.
+
+**Fault B — a powered-down function group (the idle-plug case).** If the static
+appears specifically after plugging headphones into an _idle_ engine and then
+pressing play, and a replug clears it, this is it. AppleHDA idles the codec's
+Audio Function Group (node `0x01`) to D3 and, on that path, starts streaming
+without restoring it — so audio is driven through a powered-down path. The
+headphone pin and DAC report "requested D0, actually D3"; writing D0 to them
+directly succeeds and changes nothing, because the blocker is their parent.
+
+**This is fixed in the driver since patch-31** — the kext restores the AFG
+itself. Confirm it is working:
+
+```sh
+ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E 'AFG-Probe|AFG-Wake'
+```
+
+`AFG-Probe` proves the in-kernel codec access works; `AFG-Wake` counts the
+corrections it has made. If `AFG-Wake` reads `ICI unavailable — keep the
+daemon`, the kext could not reach the codec and the retired userland helper
+`/usr/local/bin/latsof-afgwake` would be needed — that string should never
+appear on a machine booting `alcverbs=1`. Background:
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "The AFG keep-alive".
+
+**Fault C — CoreAudio missing a render deadline.** Distinguishable from the
+rate fault:
 
 |             | 44.1 kHz fault                                       | dropout fault                     |
 | ----------- | ---------------------------------------------------- | --------------------------------- |
@@ -512,6 +578,10 @@ headphones than through laptop speakers, which mask short glitches — so
 "headphones only" does not by itself mean the codec is at fault.)
 
 ### Crackle during calls — the full-duplex rate mismatch
+
+> **Stock-layout machines only.** On the minrate layout (`alcid=92` — see the
+> box at the top of §7) 44.1 kHz is never published, so the fault below cannot
+> occur. Kept as a field guide for machines running a stock AppleALC layout.
 
 There is a **third** fault, and it is the one that hits video-call apps. It has
 nothing to do with the codec or with CPU load, and it is worth knowing because
@@ -835,8 +905,23 @@ sudo rm -rf /Library/Audio/Plug-Ins/HAL/LatSOFAudioPlugin.driver
 sudo killall coreaudiod
 ```
 
-Also set the `LatSOFAudio.kext` entry in your `config.plist` under
-`Kernel → Add` to `Enabled = false`.
+**Remove the command-line helpers** — the install steps put these outside the
+bundle, so removing the kext does not take them with it:
+
+```sh
+sudo rm -f /usr/local/bin/latsof-setrate /usr/local/bin/latsof-afgwake
+launchctl bootout gui/$(id -u)/com.hackintosh.latsof.afgwake 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.hackintosh.latsof.afgwake.plist
+rm -f ~/Library/Logs/latsof-afgwake.log ~/Library/Logs/latsof-setrate.log
+```
+
+The LaunchAgent plist is the one that leaves a stray entry in System Settings →
+General → Login Items if you forget it.
+
+If you have a `LatSOFAudio.kext` entry in your `config.plist` under
+`Kernel → Add`, set it to `Enabled = false`. (Following §6 you will not — the
+kext never belonged in the EFI. The reference machine keeps the entry present
+and disabled.)
 
 ## 10. Troubleshooting
 
@@ -865,9 +950,12 @@ step 4; the KDK is never needed on this path.
 ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep Status
 ```
 
-`"Status" = "OK"` means the DSP booted. If the status says anything else, the
-firmware didn't load — wrong firmware generation (step 2) or wrong hardware
-(step 0). If status is OK but no device appears, check the audio side:
+`"Status" = "OK"` means the DSP booted. A `deferred: …` status is **neither
+pass nor fail** — the bring-up is still running; wait and re-check (see the
+Status vocabulary box in §5). If the status is a `FAILED: …` other than the
+cases below, the firmware didn't load — wrong firmware generation (step 2) or
+wrong hardware (step 0). If status is OK but no device appears, check the audio
+side:
 
 ```sh
 ioreg -rc LatSOFKernelAudioEngine -w0 | grep IOAudioEngineState
@@ -910,14 +998,19 @@ bundle back: `sudo rm -rf /Library/Extensions/LatSOFAudio.kext` first, then
 step 4 verbatim — `ditto` onto an existing bundle can silently leave the old
 binary in place. That separates a bad build from bad hardware in one reboot.
 
-**Two "internal microphone" entries / level meter dead** — you selected the
-device literally named "Internal Microphone", which is AppleHDA's codec path
-and records silence on this hardware. Select **LatSOF DMIC capture** instead
-(step 5). The dead entry's presence is normal.
+**Extra input entries / level meter dead** — you selected one of AppleHDA's
+codec paths, **Built-in Microphone** or **Built-in Line Input**, both of which
+record silence on this hardware. Select **LatSOF DMIC capture** instead
+(step 5), going by the **device name**: the `Input Source` field reads
+`Internal Microphone` for our device as well, so it cannot be used to tell them
+apart. Their presence is normal and they cannot be removed.
 
 **Microphone present but records silence (and you did select LatSOF DMIC
-capture)** — wrong firmware (must be IPC3 `sof-cml`), or your board's mics
-aren't on the DSP (step 0 / `PORTING.md`).
+capture)** — **check `Status` first.** The device is published before the DSP
+comes up, so a `deferred: …` status means the bring-up has not finished, not
+that anything is wrong; wait and re-check. If the status is `OK`, then it is
+wrong firmware (must be IPC3 `sof-cml`), or your board's mics aren't on the DSP
+(step 0 / `PORTING.md`).
 
 **Microphone permission prompts never appear / Privacy → Microphone is
 empty** — you have `amfi=0x80` in your boot-args. Remove it; it breaks TCC
