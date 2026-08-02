@@ -788,6 +788,84 @@ kext while audio is playing. Reboot.
 
 ---
 
+## Phase 16 — Three faults wearing one costume
+
+*(1–2 Aug 2026. The "headphone static" that had been chased for a week
+turned out to be three unrelated faults, each hiding the others' evidence.
+Patches 29–32; commits `c9daea1` through `1c94960`.)*
+
+The presenting symptom was singular — static from the 3.5 mm jack — and
+every earlier theory treated it as one bug. Separating it took two things
+this log keeps re-learning: measure instead of theorize, and never trust an
+observation made while a confounder was live. The confounder here was
+spectacular: the userland rate enforcer had been silently removed days
+earlier by a parallel session, so every "it still crackles at 48 kHz"
+observation from that period was worthless. Log archaeology dated the
+removal to the minute and overturned two conclusions the handoffs had
+recorded as settled.
+
+**Fault A — the rate.** Every engine rebuild (boot, jack event, wake)
+re-derived 44.1 kHz from stored per-UID preferences, and "replugging fixes
+it" was just re-rolling that dice. The structural fix came from reading
+stock AppleALC resources: sibling codecs ship `MinimumSampleRate = 48000`
+on their path nodes. Disassembling the running kernel collection confirmed
+`AppleHDAPath::isAudioStreamSupported` treats it as a hard gate, so a
+custom layout carrying the key makes 44.1 kHz *unpublishable* — no
+enforcer, no daemon, nothing to keep running. `alcid=92` ships.
+
+**Fault B — the idle-plug static.** Plug headphones while the engine is
+idle, press play, get static that only a replug cures — at a verified
+48 kHz, so not fault A. Diffing codec dumps (static vs clean) found exactly
+two differing lines: the HP pin and DAC read "requested D0, actually D3".
+Writing D0 to them returned success and did nothing, because the real
+blocker was their parent: the Audio Function Group at `0x233`. AppleHDA
+idles the AFG and, on this path, streams without restoring it. One verb
+cures it; the kext now applies it itself (see ARCHITECTURE.md, "The AFG
+keep-alive"). Every previous attempt had failed because every previous
+attempt targeted the headphone pin — the child, not the parent.
+
+**The ghost mics — a closed negative.** The dead "Built-in Microphone" and
+"Built-in Line Input" devices could not be removed. Six layout variants
+(90–97) walked every lever on hardware: strip the layout's input keys, strip
+the Platforms ADC paths, disable the pins in ConfigData, and the surgical
+combination of them. Result: inconsistent edits make AppleHDA publish
+*nothing* (93: zero devices, load average 156); consistent removal works but
+brings replug-proof static — at verified 48 kHz *and* verified D0, with the
+static and clean codec dumps **byte-identical across nine registers**. The
+amp fault lives below the codec's programmable state, and the one edit that
+removes the ghosts is the one edit that triggers it. Layouts also taught:
+`0x19`/`0x21` share connection type 0xB — the "Line In" ghost is the combo
+jack's mic half, real hardware, never a ghost at all. Do not re-attempt at
+the AppleALC layer; the dumps are archived with the layouts.
+
+**Fault C — the device-switch wedge, and why the ghosts mattered.** Select
+a ghost input, switch back to this mic, meter dead: capture-stop IPC
+timeout, twelve failed rebuilds, dead until sleep. Root cause: capture sat
+on SD1 from the days when AppleHDA published one input engine — and a dead
+codec pin does not mean a dead DMA engine. Selecting the second ghost runs
+a real stream over SD1. Capture now lives on SD6 (tag 7). Two systemic
+fixes rode along: a refused capture start re-arms a given-up retry engine
+(fresh user intent = fresh budget — before this, the demand latch waited
+forever for a rebuild that was never coming), and rebuilds now carry
+hot/cold context — cold wakes borrow a programmed SD7 immediately
+(three-for-three in the field), while rebuilds triggered under live session
+churn wait for a clean window, because twelve consecutive `ROM IPC timeout`
+is the documented signature of borrowing a hot descriptor. The evidence for
+the split arrived unprompted: the rebuild that failed twelve times under
+churn succeeded first-try at the next wake, same code, same firmware.
+
+Three lessons for the pile. A property that is *absent* must be
+distinguishable from a mechanism that ran and found nothing — the AFG fix
+shipped once with a verb addressing the wrong node, and the silence looked
+exactly like health (`AFG-Probe` now exists so it never can again). Second:
+disabled pins strip engine *names*, not engines — count
+`AppleHDAEngineInput` instances, never grep `IOAudioEngineDescription`, or
+layout 95's false "success" will repeat. Third: every "impossible" fault
+this phase yielded to the same two-dump diff; the one that produced an
+empty diff was the one that was genuinely impossible, and proving that
+emptiness is what finally allowed the question to be closed instead of
+endlessly reopened.
+
 ## If you are porting this
 
 Read `PORTING.md` for the procedure. From this log, the six things most likely

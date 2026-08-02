@@ -88,6 +88,12 @@ public:
     UInt32   getCapturePosition();
     IOBufferMemoryDescriptor *getCaptureBuffer() { return capDmaBuf; }
 
+    // patch-29: getCapturePosition() returns 0 when !hwReady, which the
+    // engine's wrap detector cannot distinguish from a genuine ring wrap —
+    // so a DSP recovery or wake window fires a spurious +341 ms loop
+    // increment. The engine asks this first and skips the poll instead.
+    bool     capturePositionValid() const { return hwReady && isCapturing; }
+
     // kernel-mic: entry points for LatSOFKernelAudioEngine. Routed through
     // the commandGate rather than calling the gated forms directly: both
     // audio classes override getWorkLoop to return ours, so family
@@ -98,6 +104,15 @@ public:
     // thread at recursion-safe cost.
     IOReturn engineStartCapture();
     void     engineStopCapture();
+    // patch-30: called from the engine's resumeAudioEngine override. Latches
+    // a deferred restart that jackPoll executes once the wake/recovery
+    // rebuild has succeeded — the family resumes us before the DSP is back.
+    void     engineRequestResume();
+    // review 1 Aug round 3: called from LatSOFKernelAudioDevice::stop before
+    // the family frees the (unretained) engine pointer. Gated: drops the
+    // resume latch and nulls the child's engine member so no later gated
+    // reader can dereference freed memory.
+    void     kernelAudioTearingDown(LatSOFKernelAudioDevice *d);
 
 private:
     IOPCIDevice *pciDevice;
@@ -171,7 +186,11 @@ private:
     static IOReturn s_startCapture (OSObject *o, void *, void *, void *, void *);
     static IOReturn s_stopCapture  (OSObject *o, void *, void *, void *, void *);
     static IOReturn s_handleWillSleep(OSObject *o, void *, void *, void *, void *);
+    static IOReturn s_handleWakeNotice(OSObject *o, void *, void *, void *, void *);
     static IOReturn s_engineStartCapture(OSObject *o, void *, void *, void *, void *);
+    static IOReturn s_engineRequestResume(OSObject *o, void *, void *, void *, void *);
+    static IOReturn s_kernelAudioTeardown(OSObject *o, void *a0, void *, void *, void *);
+    static IOReturn s_clearKernelAudio(OSObject *o, void *, void *, void *, void *);
     static IOReturn s_handleClamshellChange(OSObject *o, void *closed, void *, void *, void *);
 
     // Hardware init (called from start() and setPowerState on wake)

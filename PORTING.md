@@ -64,7 +64,14 @@ more than the vehicle):
   in boot are a timing artifact: memory decode may not be enabled yet.)
 - Read `GCAP` for the input-stream count, and note which descriptors
   AppleHDA is using (SD0 on this board). Pick a free input descriptor and
-  a stream tag no one uses; this port uses SD1 / tag 2.
+  a stream tag no one uses; this port uses SD6 / tag 7 — the HIGHEST input
+  descriptor, and that choice is a lesson. It originally used SD1 on the
+  theory "AppleHDA keeps SD0, so SD1 is free". That held only while the codec
+  layout published a single AppleHDA input engine: layouts that publish more
+  will run REAL DMA streams for every input device a user can select — a dead
+  codec pin does not mean a dead engine — and AppleHDA allocates those
+  streams from the bottom. The second engine landed on SD1, over the capture
+  ring, and wedged the mic (patch-32). Park capture as high as GCAP allows.
 
 ## 3. Board configuration
 
@@ -95,7 +102,7 @@ named.
 |---|---|---|---|---|
 | Capture channels | `kLatSOF_CapChannels` in `kext/LatSOFAudio/LatSOFAudioDevice.hpp` | how many DMIC channels the pipeline captures | the channel count that worked in your §0 Linux test / your NHLT | 2 |
 | PDM clock window | the `pdmclk` fields of the DAI_CONFIG IPC — search `pdmclk` in `LatSOFAudioDevice.cpp` | allowed DMIC clock range the firmware may pick from | start with the canonical CML window 500000–4800000; narrow only if needed | min narrowed to 2400000 |
-| Stream engine + tag | `capIdx` / `capTag` in `LatSOFAudioDevice.cpp` | which HDA input DMA engine and stream tag this driver uses — must not collide with AppleHDA | AppleHDA on single-codec laptops keeps SD0, so SD1 / tag 2 is a safe default | SD1, tag 2 |
+| Stream engine + tag | `capIdx` / `capTag` in `LatSOFAudioDevice.cpp` | which HDA input DMA engine and stream tag this driver uses — must not collide with AppleHDA | use the HIGHEST input descriptor GCAP advertises: AppleHDA allocates input streams from the bottom, one per input engine the codec layout publishes, and dead pins still get real DMA engines. SD1 "looked safe" here until a second input engine trampled it (patch-32) | SD6, tag 7 |
 | Loader stream + tag | `sIdx` / `sTag` in `initDSP()` | which **output** engine carries firmware loads. `SD(numISS)` is AppleHDA's first output engine, and the ROM binds the code-load gateway by *tag* — this is a **borrow**, not a free descriptor, governed by the contract in §5 | derived from `GCAP` (`sIdx = numISS`); do not relocate without moving the tag too | SD7, tag 1 |
 | DMIC topology payloads | `kext/LatSOFAudio/tplg_ipc_data.h` | the captured IPC topology stream — recorded by the parent project from a working Linux session on the donor C1030 — with the DMIC/DAI messages adapted to this board's NHLT | adapt the DMIC/DAI messages to **your** NHLT (`sudo cat /sys/firmware/acpi/tables/NHLT > nhlt.bin` under Linux), or capture your own stream the same kprobe way — either path is the substantive porting work, see §3 | this board's NHLT |
 | Device names | `setDeviceName` / `setDeviceShortName` / `setManufacturerName` / `setDeviceModelName` calls in `LatSOFKernelAudioDevice::initHardware`, and `setDescription` in `LatSOFKernelAudioEngine::initHardware` (`kext/LatSOFAudio/LatSOFKernelAudio.cpp`) | the `initHardware` calls set the device identity seen in `ioreg` (IOAudioDeviceName) and the manufacturer/model strings; **the name Sound settings displays is the engine's `setDescription`** ("LatSOF DMIC capture") | cosmetic — change freely. Do **not** touch the transport type or the `'imic'` input selector next to them: those are what make Siri accept the device | ioreg: "LatSOF Internal Microphone"; Sound settings: "LatSOF DMIC capture" |

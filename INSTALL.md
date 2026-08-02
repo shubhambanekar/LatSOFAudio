@@ -234,6 +234,22 @@ appears in *both* lines (`ctl`, `fmt`, `bdl`, `ppctl`) must show the same
 value in each. That's the proof AppleHDA's borrowed stream was handed back
 untouched — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+> **Status vocabulary since patches 30–32.** `"Status" = "OK"` is still the
+> pass, and a bare `FAILED: FW load` on a quiet cold boot still means roll
+> back. But three states that *look* alarming are working-as-designed:
+>
+> | Property | Meaning |
+> |---|---|
+> | `Status = "deferred: AppleHDA output busy at load"` | hot-load while audio was playing; the retry engine takes over — wait for a quiet moment |
+> | `Status = "deferred: retrying after FAILED: … (n/12)"` | a rebuild attempt failed with budget left; still in progress, not terminal |
+> | `Status = "FAILED: DSP init retries exhausted (last: …)"` | terminal for *this* round — but a sleep/wake or simply re-selecting the mic re-arms it (`Wake-Retry = "re-armed by capture demand"`) |
+>
+> Other properties worth knowing: `AFG-Probe` (proof the in-kernel codec
+> access works — appears on first playback), `AFG-Wake` (count of headphone
+> power-state corrections), `Engine-Resume` (sleep/wake restart machinery),
+> and `Capture-Debug` should show `ppctl=0x40000040 ctl=0x74xxxx` — capture
+> lives on **SD6, tag 7** since patch-32.
+
 **Does macOS see a microphone?**
 
 ```sh
@@ -285,6 +301,29 @@ its `Enabled` to `false`** (or remove it). Leaving both in place risks two
 copies of the driver racing for the same hardware.
 
 ## 7. Fix headphone crackle (optional but recommended)
+
+> **SUPERSEDED on the reference machine (2 Aug 2026), kept as a field guide.**
+> The rate fault is now closed at the source: a custom AppleALC build
+> (`contrib/alc236-layout91-rebuild.sh`, boot with `alcid=92`) adds
+> `MinimumSampleRate = 48000` to the ALC236 output path, so AppleHDA never
+> publishes 44.1 kHz at all — the stuck cold boot, the replug roulette and
+> the mid-call rate drag described below **cannot occur**. Disassembly of
+> the running `AppleHDAPath::isAudioStreamSupported` confirmed the key is a
+> hard gate, not advisory. Consequences for this section:
+>
+> - `latsof-setrate` is still a fine one-shot *diagnostic* (`latsof-setrate`
+>   with no argument reports the rate), and the correct tool on machines
+>   running a stock layout.
+> - **Do not install the `--enforce` LaunchAgent** described at the end of
+>   this section — under the minrate layout it has nothing to do, and this
+>   project's history shows resident audio-state writers must earn their
+>   keep. The reference machine runs none.
+> - Do not remove the ghost "Built-in Microphone"/"Built-in Line Input"
+>   devices the stock-derived layout publishes: six layout variants (90–97)
+>   proved on hardware that every route to removing them breaks the
+>   headphone amp through analog state no codec register exposes, while the
+>   capture-side hazard they created was fixed in the driver instead
+>   (patch-32 moved capture to SD6). See `DEBUGGING-LOG.md`.
 
 Unrelated to the microphone, but it bites nearly every ALC laptop and this is
 where people look for it.

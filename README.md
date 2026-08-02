@@ -121,7 +121,9 @@ One kext, two halves:
    it matches `IOResources` and locates the HDA controller by registry walk, so
    **AppleHDA keeps working** — speakers, headphones and AppleALC are
    untouched. The two drivers share the controller by partitioning stream
-   descriptors (AppleHDA keeps SD0; this driver uses capture SD1, tag 2), with
+   descriptors (AppleHDA allocates input streams from the bottom; this driver
+   captures on **SD6, tag 7** — the highest input descriptor, out of reach of
+   however many input engines the codec layout publishes), with
    one carefully-managed exception: during each firmware load the code loader
    briefly borrows AppleHDA's first output descriptor and hands it back
    byte-identical (see the FAQ, and "The borrowed-stream contract" in
@@ -200,6 +202,23 @@ Fix with `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`.
 
 ## Headphone crackle (not a microphone problem, but read this)
 
+> **2 Aug 2026 — this whole class of fault is now fixed structurally, and
+> everything below survives as history and as a field guide for other
+> machines.** The reference machine runs a custom AppleALC layout
+> (`alcid=92`, built by `contrib/alc236-layout91-rebuild.sh`) that sets
+> `MinimumSampleRate = 48000` on the output-path nodes. AppleHDA then never
+> *publishes* 44.1 kHz — verified by disassembling `AppleHDAPath::
+> isAudioStreamSupported` in the running kernel collection — so CoreAudio
+> cannot select it: no stuck cold boots, no rate roulette on replug, and
+> call apps physically cannot drag the output down. No resident enforcer,
+> nothing to keep running. `latsof-setrate` remains useful only as a
+> one-shot *diagnostic* on machines still running a stock layout.
+>
+> A second, rarer static — a jack event landing on an idle engine — turned
+> out to be an entirely different fault (the codec's Audio Function Group
+> left powered down by AppleHDA) and is fixed inside the kext itself; see
+> `DEBUGGING-LOG.md`.
+
 Static or crackling from the 3.5 mm jack on ALC laptops is almost always the
 classic **44.1 kHz problem**: set the output to **48,000 Hz** in Audio MIDI
 Setup.
@@ -228,9 +247,12 @@ automation caused a worse fault than the one it fixed, and was retracted.
 and the rate is corrected solely after it has been wrong *continuously* for
 eight seconds. A jack plug settles long before that and never triggers it; a
 call app holding the output at 44.1 does, and gets corrected once. Both
-behaviours were verified before it shipped. Run it from a LaunchAgent if you
-want it permanent — the recipe is in [`INSTALL.md`](INSTALL.md) §7 — or keep
-using the one-shot `latsof-setrate 48000` followed by a replug or sleep/wake.
+behaviours were verified before it shipped. On a machine running the minrate
+layout (see the note at the top of this section) there is nothing for it to
+do and it should not be run resident at all; on a stock layout, prefer the
+one-shot `latsof-setrate 48000` followed by a replug or sleep/wake, and treat
+the LaunchAgent recipe in [`INSTALL.md`](INSTALL.md) §7 as the last resort it
+was written to be.
 Remember that pinning the rate alone never reprograms the codec path; only an
 engine rebuild does.
 `CodecCommander.kext` helps with jack pops but does **not** fix this; the
