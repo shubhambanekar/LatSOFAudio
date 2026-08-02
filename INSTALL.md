@@ -343,7 +343,7 @@ copies of the driver racing for the same hardware.
 >   project's history shows resident audio-state writers must earn their
 >   keep. The reference machine runs none.
 > - Do not remove the ghost "Built-in Microphone"/"Built-in Line Input"
->   devices the stock-derived layout publishes: six layout variants (90–97)
+>   devices the stock-derived layout publishes: layout variants 90–97
 >   proved on hardware that every route to removing them breaks the
 >   headphone amp through analog state no codec register exposes, while the
 >   capture-side hazard they created was fixed in the driver instead
@@ -859,7 +859,10 @@ In order, you want: `com.hackintosh.LatSOFAudio (1.1.5)` followed by a UUID —
 and if you noted the old build's UUID before updating, this one must be
 _different_, which is your proof the running kext is the new one; then
 `"Status" = "OK"`, with `SD-Borrow` and `SD-Final` naming the same stream and
-agreeing field-for-field (`sd7` on the reference laptop — the number varies by
+agreeing on every field the two have in common (`SD-Final` prints three more:
+`cbl`, `lvi`, `spiben`). `sd7` here is the **output** stream the loader borrows
+and returns — distinct from capture, which has run on **SD6, tag 7** since
+patch-32. Seeing both numbers is correct, not a contradiction. (The number varies by
 machine, and step 5 explains the comparison); then a `LatSOF DMIC capture`
 block reading `Default Input Device: Yes`, `Input Channels: 2`,
 `Current SampleRate: 48000`, `Transport: Built-in` and
@@ -1013,7 +1016,9 @@ wrong firmware (must be IPC3 `sof-cml`), or your board's mics aren't on the DSP
 (step 0 / `PORTING.md`).
 
 **Microphone permission prompts never appear / Privacy → Microphone is
-empty** — you have `amfi=0x80` in your boot-args. Remove it; it breaks TCC
+empty** — you have `amfi=0x80` in your boot-args. (If you already run
+AMFIPass and have no `amfi=0x80` — which is what the reference machine does —
+this is not your cause; reset TCC for the app instead.) Remove it; it breaks TCC
 prompts system-wide. If something else in your EFI needs AMFI relaxed
 (OCLP-patched Wi-Fi is the usual culprit), use
 [AMFIPass](https://github.com/acidanthera/AMFIPass) instead.

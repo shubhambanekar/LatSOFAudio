@@ -199,8 +199,11 @@ sensitivity; check your own raw levels before copying it.
 
 Three things in this file are load-bearing, not cosmetic. The built-in
 transport type plus the `'imic'` input selector are what make Siri accept
-the device (see the Siri section in the README). The back-dated timestamps
-in `stampBackdated` are what keep the CoreAudio clock honest. And the
+the device (see the Siri section in the README). The back-dated timestamps are
+what keep the CoreAudio clock honest — since patch-29 that means `stampAt()`
+fed by `readPositionAtEdge()`, which stamps a caught DPIB edge and rejects
+preempted reads; `stampBackdated()` is still in the file but is **dead code,
+do not preserve it in a port**. And the
 install path is `/Library/Extensions` + `sudo kmutil load -p`, **not** your
 EFI — the kext links `IOAudioFamily`, which OpenCore cannot resolve, and an
 EFI entry fails silently (INSTALL.md §6).

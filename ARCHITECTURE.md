@@ -74,7 +74,11 @@ from it.
   dangerous thing this driver does; see "The borrowed-stream contract"
   below.
 - **Per-stream decoupling only.** `PPCTL` is written to decouple SD6 into
-  DSP mode exactly once at capture start, and it is re-coupled at stop.
+  DSP mode at capture start and re-coupled at stop. (Not literally once:
+  the CML couple→write-FMT→decouple quirk toggles it three times inside
+  `startCaptureGated` (`:2791-2808`), and both IPC-timeout bails re-clear it
+  (`:2841`, `:2887`). The invariant actually being defended is that every
+  write is a read-modify-write of `(1U << capIdx)`.)
   Bit 0 (AppleHDA's SD0) is never touched. An early version of this code
   applied the decouple with an uninitialised index — decoupling SD0 on
   every boot, harmlessly for playback but fatally for our capture, which
@@ -154,8 +158,14 @@ the machine — capture is strictly on-demand from a fully booted system.
 `LatSOFKernelAudioDevice` is a thin `IOAudioDevice` — it owns no hardware and
 exists only so IOAudioFamily has a device node to hang an engine on — and it
 activates one `LatSOFKernelAudioEngine`, an `IOAudioEngine` over the capture
-ring. `LatSOFAudioDevice::start()` creates, attaches and starts the device after
-`initDSP()` has succeeded, handing it a **non-retained** back-pointer to itself
+ring. `LatSOFAudioDevice::start()` creates, attaches and starts the device as
+the last thing it does, with no `hwReady` guard — on the fast path that follows
+a successful `initDSP()`, but the patch-30 deferred load publishes the device
+with the DSP still down, because the engine's `initHardware` needs the capture
+ring and nothing else. That is **not** the same as a hard `initDSP()` failure:
+a failure that did not arm `gWakeReinitPending` sets `Status = "FAILED: DSP
+init"` and bails out of `start()` (`LatSOFAudioDevice.cpp:728`), publishing
+nothing. It hands the device a **non-retained** back-pointer to itself
 (`setOwner`) which it passes on to the engine (`initWithOwner`); the owner
 outlives both by construction, which is what makes not retaining safe. Publication
 failure is deliberately non-fatal — capture still works through the UserClient —
@@ -172,8 +182,12 @@ below for what survived the move and what did not.
 `owner->getCaptureBuffer()->getBytesNoCopy()` for `kLatSOF_CapBufferSize` bytes.
 The engine's sample buffer _is_ the DMA ring the DSP writes into. There is no
 copy layer and no second ring: the DSP writes where CoreAudio reads. The
-ring is allocated by `initDSP()` before the engine is ever constructed, and
-`initHardware` refuses to proceed if it is absent.
+ring is allocated by `start()` itself (patch-30 fix 2,
+`LatSOFAudioDevice.cpp:642-677`) — before the deferral decision and before the
+engine is constructed; `initDSP()`'s own allocation block is a no-op behind its
+`!capDmaBuf` guards. That hoist is precisely what makes a deferred publish
+possible: the ring is pure memory with no MMIO, so it can exist while the DSP
+is still down. `initHardware` refuses to proceed if it is absent.
 
 **Format and geometry.** One input stream, 48 kHz, 2 channels, signed 32-bit
 little-endian, high-byte aligned, `kLatSOF_BufferFrames` = 16384 frames of ring
@@ -206,9 +220,31 @@ timestamps out of the loop. Until someone runs that, treat the number as
 provisional and do not build anything on it.
 
 **Timestamping, and why it is back-dated.** `takeTimeStamp` assumes the event
-being stamped is happening _now_. Neither of this engine's two stamp sites is.
-`stampBackdated(incrementLoop, framesAgo)` therefore computes
-`now − framesAgo/48000` seconds and stamps that instead:
+being stamped is happening _now_. Neither of this engine's two stamp sites is,
+so both stamp an explicit earlier instant instead.
+
+> **Since patch-29 the mechanism is `stampAt`, not `stampBackdated`.**
+> `stampAt(incrementLoop, AbsoluteTime at, UInt32 pos)`
+> (`LatSOFKernelAudio.cpp:248-257`) takes the instant directly rather than
+> deriving it from a frame count, and it is fed by `readPositionAtEdge()`
+> (`:295-328`), which spins until DPIB actually ticks, brackets that read
+> between two `clock_get_uptime` calls, and **rejects** any sample whose
+> bracket exceeds `kEdgeReadWindowNS` (20 µs) rather than stamping a
+> preempted one. The deadline is in **time** (`kEdgeDeadlineNS` = 2 ms,
+> `:34`), not iterations. Call sites: `performAudioEngineStart:350-358` and
+> `wrapTimerFired:490-499`.
+>
+> `stampBackdated()` is still defined (`:234-242`) but has **zero call
+> sites** — retained, unused. `latsof_edgelock=0` (`:101-105`) disables the
+> edge lock and falls back to plain `clock_get_uptime` stamping; there is
+> also a free-run branch for when the DSP is down (`:459-483`). The engine
+> publishes `Clock-Edge-Misses`, `Clock-NotReady-Polls` and
+> `Clock-Preempt-Rejects` (`:375-381`) — **these are the counters whose
+> patch-29 §8 acceptance test was never run**, so treat them as
+> uninstrumented rather than as known-good.
+
+The back-dating rationale below still holds, and is why the mechanism exists
+at all:
 
 - `wrapTimerFired` is a 100 ms `IOTimerEventSource` that watches
   `getCurrentSampleFrame()` (DPIB/8) for the position moving backwards, which on
@@ -440,7 +476,8 @@ it takes SD7. Measured with audio running, `SD-Borrow` read `ctl=0x14001e` —
 produced immediate loud static, curable only by replugging the jack.
 Snapshot/restore cannot help here: it faithfully hands back a descriptor whose
 playback was already destroyed in flight. The wake path already guards against
-exactly this — `jackPoll` tests `rd8(hdaBase, outSd) & SD_CTL_RUN` and defers
+exactly this — `jackPoll` calls `outputSdBusyState()` (`:375-384`, returning
+−1/0/1/2) and defers
 the rebuild while the descriptor is busy — but the `start()` path that calls
 `initDSP()` at boot has no equivalent preflight. The correct fix is that same
 defer-and-retry check on the load path, keeping the SD7 borrow. Until it
@@ -584,7 +621,7 @@ AppleHDA is playing hijacks a running stream: `SD-Borrow` read `ctl=0x14001e`
 static that only a jack replug cleared. The snapshot/restore contract cannot
 help there; it restores registers, not a running FIFO, and AppleHDA never
 re-programs what it believes it still owns. The wake path already defers while
-the descriptor is busy — `jackPoll` checks `rd8(hdaBase, outSd) & SD_CTL_RUN` —
+the descriptor is busy — `jackPoll` calls `outputSdBusyState()` (`:2239`) —
 but the `start()` path that calls `initDSP()` had no such check.
 
 **Patch 30 added it — with one qualification that matters on this machine.**
@@ -635,7 +672,10 @@ immediately after the hand-back, while the function still has work to do — for
 a week it faithfully reported a perfect restore on wakes where the speakers
 were already dead, because the code that killed them ran later. `SD-Final` is
 read after the last write the function makes to the descriptor, and must match
-`SD-Borrow` field for field:
+`SD-Borrow` on every field the two have in common — `SD-Final` prints three
+extra (`cbl`, `lvi`, `spiben`), so a literal field-for-field match is not
+possible. `SD-Final` is also deliberately absent when the snapshot was never
+valid, which is itself the signal that no borrow happened:
 
 ```sh
 ioreg -rc LatSOFAudioDevice -d 1 -w0 | grep -E "SD-Borrow|SD-Final"

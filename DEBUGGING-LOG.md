@@ -231,7 +231,9 @@ argument with AMFIPass (plus `-amfipassbeta`, since that build predates
 Sequoia) satisfied the WiFi stack without breaking permissions.
 
 QuickTime then recorded. Both security relaxations were subsequently removed
-and verified unnecessary — the machine runs stock AMFI enforcement.
+and verified unnecessary for this driver. (The machine itself does run
+AMFIPass with `-amfipassbeta`, for its OCLP-patched Wi-Fi — but nothing in
+the audio path needs it.)
 
 **Lesson:** an unexplained boot hang after removing a boot argument means
 something else in your EFI depended on it. Find out what before restoring it
@@ -838,7 +840,7 @@ keep-alive"). Every previous attempt had failed because every previous
 attempt targeted the headphone pin — the child, not the parent.
 
 **The ghost mics — a closed negative.** The dead "Built-in Microphone" and
-"Built-in Line Input" devices could not be removed. Six layout variants
+"Built-in Line Input" devices could not be removed. Layout variants
 (90–97) walked every lever on hardware: strip the layout's input keys, strip
 the Platforms ADC paths, disable the pins in ConfigData, and the surgical
 combination of them. Result: inconsistent edits make AppleHDA publish
